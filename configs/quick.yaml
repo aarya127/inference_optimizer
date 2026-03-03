@@ -1,0 +1,29 @@
+# Quick benchmark configuration for fast testing
+# Suitable for development and quick comparisons
+
+model:
+  name: "gpt2"
+  path: null
+
+backends:
+  - pytorch
+  - vllm
+
+quantizations:
+  - fp16
+
+batch_sizes:
+  - 1
+  - 4
+
+benchmark:
+  num_requests: 20  # Reduced for speed
+  max_new_tokens: 64
+  temperature: 0.8
+  warmup_requests: 5
+
+output:
+  dir: "results/quick"
+  save_results: true
+  generate_plots: true
+  generate_report: true

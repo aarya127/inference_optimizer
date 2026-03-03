@@ -1,0 +1,76 @@
+from setuptools import setup, find_packages
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+setup(
+    name="inference-optimizer",
+    version="0.1.0",
+    author="Inference Optimizer Team",
+    description="A comprehensive benchmarking tool for LLM inference engines",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://github.com/aarya127/inference_optimizer",
+    packages=find_packages(),
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
+    python_requires=">=3.8",
+    install_requires=[
+        "numpy>=1.24.0",
+        "pandas>=2.0.0",
+        "matplotlib>=3.7.0",
+        "seaborn>=0.12.0",
+        "pyyaml>=6.0",
+        "tqdm>=4.65.0",
+        "psutil>=5.9.0",
+        "GPUtil>=1.4.0",
+        "torch>=2.0.0",
+        "transformers>=4.35.0",
+        "accelerate>=0.25.0",
+        "nvidia-ml-py3>=7.352.0",
+        "py-cpuinfo>=9.0.0",
+        "scipy>=1.10.0",
+        "scikit-learn>=1.3.0",
+        "plotly>=5.17.0",
+        "click>=8.1.0",
+        "rich>=13.5.0",
+        "tabulate>=0.9.0",
+        "omegaconf>=2.3.0",
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.4.0",
+            "pytest-cov>=4.1.0",
+            "pytest-mock>=3.11.0",
+            "black>=23.7.0",
+            "isort>=5.12.0",
+            "flake8>=6.1.0",
+            "mypy>=1.5.0",
+        ],
+        "vllm": ["vllm>=0.2.0"],
+        "tensorrt": ["tensorrt>=8.6.0"],
+        "deepspeed": ["deepspeed>=0.12.0"],
+        "triton": ["tritonclient[all]>=2.40.0"],
+        "all": [
+            "vllm>=0.2.0",
+            "tensorrt>=8.6.0",
+            "deepspeed>=0.12.0",
+            "tritonclient[all]>=2.40.0",
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "inference-optimizer=src.cli:main",
+        ],
+    },
+)
