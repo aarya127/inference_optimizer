@@ -1,0 +1,40 @@
+This is the strongest choice if your goal is developer adoption, GitHub traction, and industry usage.
+
+Why it stands out
+KV cache is the #1 bottleneck in LLM inference.
+
+Everyone struggles with:
+
+Fragmentation
+
+Memory blow-up
+
+Continuous batching
+
+Prefill vs decode imbalance
+
+A tool that visualizes, profiles, and compares memory strategies would be used by:
+
+Researchers
+
+Engineers
+
+Framework developers
+
+Why people would care
+vLLM’s PagedAttention is widely used but poorly understood.
+
+No tool exists today that:
+
+Shows fragmentation over time
+
+Simulates batching strategies
+
+Benchmarks different KV layouts
+
+This would become the “go-to” diagnostic tool for LLM inference.
+
+Why it’s impactful
+It helps everyone deploying LLMs, not just multimodal users.
+
+It could influence future versions of vLLM, TensorRT-LLM, and DeepSpeed.

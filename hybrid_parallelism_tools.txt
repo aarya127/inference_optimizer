@@ -1,0 +1,53 @@
+Why it stands out
+Multimodal models (Llama 3.2, Qwen-VL, Pixtral) are exploding in use.
+
+Serving them efficiently is unsolved and painful today.
+
+Vision encoders are often too small for tensor parallelism, but frameworks still apply TP blindly.
+
+A system that automatically chooses TP vs DP based on encoder size, resolution, and GPU topology would be immediately useful to:
+
+vLLM
+
+TensorRT-LLM
+
+Triton
+
+Any enterprise deploying VLMs
+
+Why people would care
+Companies are actively struggling with multimodal inference scaling.
+
+A 30–45% throughput improvement is enormous in production.
+
+This is publishable as systems research and shippable as an open-source tool.
+
+Why it’s novel
+No serving framework today does dynamic parallelism selection.
+
+No one has published a systematic study of “when TP hurts more than it helps” for VLMs.
+
+This is the kind of project that gets attention from:
+
+ML systems researchers
+
+GPU engineers
+
+Industry practitioners
+
+Open-source maintainers
+
+Why it’s novel
+No serving framework today does dynamic parallelism selection.
+
+No one has published a systematic study of “when TP hurts more than it helps” for VLMs.
+
+This is the kind of project that gets attention from:
+
+ML systems researchers
+
+GPU engineers
+
+Industry practitioners
+
+Open-source maintainers
