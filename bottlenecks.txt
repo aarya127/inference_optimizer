@@ -1,0 +1,38 @@
+To formally define the bottlenecks in your **Adaptive Multimodal Inference Optimizer**, we can break down each stage of the pipeline into its primary physical and architectural constraints based on the provided research.
+
+The total latency is defined as:
+$T_{total} = T_{vision} + T_{prefill} + T_{decode}$
+
+### 1. Vision Encoder Bottleneck: Communication Synchronization ($T_{vision}$)
+In multimodal models, the vision encoder is typically small (0.2%–2.3% of total parameters), yet it often defaults to **Tensor Parallelism (TP)**, which shards weights across GPUs. This creates a communication-bound bottleneck.
+
+*   **Formal Bottleneck**: The number of **All-Reduce** synchronization points. 
+*   **Cost Model**: $T_{vision} = T_{compute} + (2 \times N_{blocks} \times T_{sync})$, where $N_{blocks}$ is the depth of the encoder (e.g., 63 blocks for the **step3** model).
+*   **Optimization Lever**: Switching to **Batch-Level Data Parallelism (DP)** replicates weights, reducing the cost to a single **All-Gather** at the end ($T_{sync} \times 1$), which can improve throughput by **10% to 45%**.
+
+### 2. LLM Prefill Bottleneck: Token Explosion ($T_{prefill}$)
+The prefill stage is **compute-bound** and processes the visual tokens and text prompt to generate the "first token".
+
+*   **Formal Bottleneck**: **Visual Token Count ($N_{v\_tokens}$)**. High-resolution images produce a massive number of tokens, which increases the LLM forward pass time linearly or quadratically depending on the attention mechanism.
+*   **Cost Model**: $T_{prefill} \propto (N_{v\_tokens} + N_{prompt\_tokens})$. For example, an 1152px image can produce over 7,000 tokens, causing a "token explosion" that dominates the Time-to-First-Token (TTFT).
+*   **Optimization Lever**: Reducing resolution or using hierarchical downsampling (like **FastViTHD**) to generate **4x to 16x fewer tokens**.
+
+### 3. LLM Decode Bottleneck: Memory Bandwidth & KV Cache ($T_{decode}$)
+The decode stage generates tokens autoregressively and is **memory-bound**. The latency is dominated by the speed of transferring weights and the **Key-Value (KV) cache** from memory to the GPU.
+
+*   **Formal Bottlenecks**: 
+    *   **Memory Bandwidth**: The rate of data transfer for each generated token.
+    *   **KV Cache Capacity**: The memory grows linearly with sequence length: $Total_{KV} \propto batch \times sequence\_length \times layers \times hidden\_size$.
+*   **Fragmentation**: Traditional contiguous allocation wastes **60%–80%** of memory.
+*   **Optimization Lever**: Implementing **PagedAttention** to store KV cache in non-contiguous blocks, reducing memory waste to **<4%** and enabling larger batch sizes.
+
+### 4. The Global Optimization Goal
+The ultimate goal for your optimizer is to find the **Pareto-optimal curve** that balances image resolution (accuracy) against the constraints of the hardware.
+
+**Formal Objective Function:**
+$\text{minimize } T_{total}(S_{parallel}, R_{image}, M_{kv})$
+$\text{subject to:}$
+1.  $\text{Memory}_{weights} + \text{Memory}_{KV\_cache} \leq \text{GPU\_Memory}$
+2.  $\text{TTFT} \leq \text{Latency\_Budget}$
+
+Your system functions as a **Latency-Aware Controller** that dynamically toggles the parallelism strategy ($S_{parallel}$) for the encoder and manages the KV cache allocation ($M_{kv}$) for the decoder, ensuring that high-resolution inputs do not cause "decode starvation" due to token explosion.

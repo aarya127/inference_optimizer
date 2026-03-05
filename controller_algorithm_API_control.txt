@@ -1,0 +1,365 @@
+Perfect. Now we move from “idea” → **formal system specification**.
+
+I’ll give you two things:
+
+1. 📐 A mathematically defined controller algorithm
+2. 🏗 A production-style API contract
+
+We’ll keep this clean and rigorous.
+
+---
+
+# PART 1 — Mathematical Definition of the Controller
+
+---
+
+# 1️⃣ Problem Setup
+
+Each request ( i ) arrives with:
+
+* Image resolution ( R_i )
+* Prompt token count ( N_{p,i} )
+* Estimated vision token count ( N_{v,i}(R) )
+
+The system state at time ( t ):
+
+[
+\mathcal{S}_t =
+{
+B_t,,
+Mem_t,,
+KV_t,,
+U_t,,
+Frag_t
+}
+]
+
+Where:
+
+* ( B_t ) = active batch size
+* ( Mem_t ) = memory used
+* ( KV_t ) = total KV cache size
+* ( U_t ) = GPU utilization
+* ( Frag_t ) = fragmentation ratio
+
+---
+
+# 2️⃣ Strategy Space
+
+Controller chooses:
+
+[
+a = (S_{parallel}, R, M_{kv}, B_{policy})
+]
+
+Where:
+
+* ( S_{parallel} \in {single, replicate, TP} )
+* ( R \in {224, 336, 448, 576, ...} )
+* ( M_{kv} \in {contiguous, paged} )
+* ( B_{policy} \in {static, continuous} )
+
+This is your action space.
+
+---
+
+# 3️⃣ Cost Models
+
+## Vision Stage
+
+[
+T_{vision}(S_{parallel}, R)
+===========================
+
+\frac{FLOPs(R)}{\Theta_{compute}}
++
+\alpha \cdot N_{collectives}
++
+\beta \cdot Bytes_{comm}
+]
+
+If replicate:
+[
+N_{collectives} = 1
+]
+
+If TP:
+[
+N_{collectives} \propto N_{blocks}
+]
+
+---
+
+## Prefill Stage
+
+Let:
+
+[
+N_{total} = N_v(R) + N_p
+]
+
+Then:
+
+[
+T_{prefill}(R) \approx
+c_1 \cdot N_{total}^{\gamma}
+]
+
+Where:
+
+* ( \gamma \in [1,2] ) depending on attention efficiency
+
+---
+
+## Decode Stage
+
+KV size:
+
+[
+KV = B \cdot S \cdot L \cdot H
+]
+
+Per-token decode time:
+
+[
+T_{decode} \approx
+\frac{Bytes_{weights} + Bytes_{KV}}{Bandwidth}
+]
+
+Paged allocation reduces effective memory waste:
+
+[
+KV_{effective} = KV \cdot (1 + Frag)
+]
+
+---
+
+# 4️⃣ Total Latency
+
+[
+T_{total}(a)
+============
+
+T_{vision}
++
+T_{prefill}
++
+T_{decode}
+]
+
+---
+
+# 5️⃣ Constraints
+
+Memory constraint:
+
+[
+Mem_{weights}
++
+KV_{effective}
+\leq
+GPU_{capacity}
+]
+
+SLA constraint:
+
+[
+TTFT \leq \tau
+]
+
+Optional accuracy constraint:
+
+[
+Accuracy(R) \geq \epsilon
+]
+
+---
+
+# 6️⃣ Optimization Objective
+
+Per-request:
+
+[
+a^* =
+\arg\min_a T_{total}(a)
+]
+
+Subject to constraints.
+
+---
+
+# 7️⃣ Controller Algorithm (Deterministic Version)
+
+At request arrival:
+
+1. Extract features:
+   [
+   x = (N_v, N_p, B_t, Mem_t, Frag_t)
+   ]
+
+2. Enumerate feasible strategies ( a_j )
+
+3. For each strategy:
+
+   * Predict ( T_{total}(a_j) )
+   * Check memory constraint
+
+4. Select:
+   [
+   a^* = \min_j T_{total}(a_j)
+   ]
+
+5. Execute with configuration ( a^* )
+
+This is a **model-predictive scheduler**.
+
+---
+
+# 8️⃣ Advanced Version (Online Learning)
+
+You maintain:
+
+[
+\hat{T}_{model}
+]
+
+Update parameters via regression:
+
+[
+\theta \leftarrow \theta - \eta \nabla (T_{pred} - T_{actual})^2
+]
+
+Now it becomes adaptive.
+
+---
+
+# PART 2 — Production-Style API Contract
+
+We’ll define this like a real inference service.
+
+---
+
+# 1️⃣ Public Endpoint
+
+### POST /v1/multimodal/generate
+
+## Request Schema
+
+```json
+{
+  "image": "base64_or_url",
+  "prompt": "Describe the image.",
+  "generation": {
+    "max_tokens": 200,
+    "temperature": 0.7
+  },
+  "preferences": {
+    "latency_priority": 0.7,
+    "min_accuracy_level": "medium"
+  }
+}
+```
+
+---
+
+## Response Schema
+
+```json
+{
+  "id": "req_12345",
+  "output_text": "The image shows a dog running on a beach.",
+  "performance": {
+    "ttft_ms": 164,
+    "decode_tokens_per_sec": 87,
+    "vision_strategy": "replicate",
+    "resolution_used": 448,
+    "kv_mode": "paged",
+    "batching_mode": "continuous",
+    "memory_peak_mb": 10832
+  }
+}
+```
+
+---
+
+# 2️⃣ Internal Controller Interface
+
+The controller receives:
+
+```python
+ControllerInput:
+    vision_tokens: int
+    prompt_tokens: int
+    active_batch: int
+    memory_used_mb: float
+    kv_cache_mb: float
+    fragmentation_ratio: float
+    gpu_utilization: float
+```
+
+Returns:
+
+```python
+ControllerDecision:
+    vision_strategy: str
+    image_resolution: int
+    kv_mode: str
+    batching_mode: str
+```
+
+---
+
+# 3️⃣ Execution Flow
+
+```text
+Request → Feature Extractor → Controller
+        → Execution Planner → Model Runtime
+        → Telemetry → Controller Feedback
+```
+
+---
+
+# 4️⃣ SLA-Aware Variant
+
+Add headers:
+
+```
+X-Latency-Budget: 200ms
+X-Throughput-Mode: high
+```
+
+Controller modifies objective:
+
+[
+\min T_{total}
++
+\lambda \cdot Memory
+]
+
+Now it's production-realistic.
+
+---
+
+# What You’ve Just Built
+
+You now have:
+
+* A formally defined action space
+* Cost models
+* Constraints
+* Optimization rule
+* Feedback update mechanism
+* Public API spec
+
+That’s no longer “project idea.”
+That’s a **systems design document.**
+
+---
+
+If you’d like next, I can:
+
+* Convert this into a research-style problem statement
+* Or turn it into a 2-page technical design doc (like a FAANG internal review)
+* Or help you simplify this for implementation on your M3
+
+You’re thinking at the right level now.

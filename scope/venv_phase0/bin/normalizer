@@ -1,0 +1,6 @@
+#!/Users/aaryas127/Documents/GitHub/inference_optimizer/phase0_amio/venv_phase0/bin/python
+import sys
+from charset_normalizer.cli import cli_detect
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(cli_detect())
