@@ -171,13 +171,13 @@ class TechStackValidator:
                 memory_bytes = int(result.stdout.split(":")[1].strip())
                 memory_gb = memory_bytes / (1024 ** 3)
                 
-                # Minimum 16GB recommended
-                sufficient = memory_gb >= 16
+                # Minimum 8GB required (SmolVLM confirmed working on 8GB M3)
+                sufficient = memory_gb >= 8
                 
                 self.results.append(ValidationResult(
                     check_name="Unified Memory",
                     passed=sufficient,
-                    message=f"{memory_gb:.1f} GB available (recommended: ≥16GB)",
+                    message=f"{memory_gb:.1f} GB available (minimum: ≥8GB)",
                     details={"memory_gb": memory_gb, "sufficient": sufficient}
                 ))
             else:

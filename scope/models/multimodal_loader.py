@@ -12,7 +12,7 @@ Designed for Apple Silicon M3 with unified memory.
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load as load_language_model
-from mlx_lm.utils import generate as mlx_generate
+from mlx_lm import generate as mlx_generate
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path

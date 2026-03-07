@@ -195,10 +195,16 @@ class QuantizedLinear(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass with on-the-fly dequantization"""
         # Dequantize weights
+        metadata = {
+            'scale': self.weight_scales,
+            'zero': self.weight_zeros,
+            'original_shape': self.weight_quantized.shape,
+            'padded': False,
+            'pad_size': 0
+        }
         weight_fp16 = self.quantizer.dequantize_weights(
             self.weight_quantized,
-            self.weight_scales,
-            self.weight_zeros
+            metadata
         )
         
         # Standard linear operation
@@ -261,8 +267,10 @@ class ModelQuantizer:
                     original_size += weights.size * 2  # FP16 = 2 bytes
                     
                     # Quantize
-                    q_weights, scales, zeros = self.quantizer.quantize_weights(weights)
-                    
+                    q_weights, q_meta = self.quantizer.quantize_weights(weights)
+                    scales = q_meta['scale']
+                    zeros = q_meta['zero']
+
                     # Calculate quantized size
                     quantized_size += q_weights.size * 0.5  # INT4 = 0.5 bytes (packed)
                     quantized_size += (scales.size + zeros.size) * 2  # FP16 scales/zeros
@@ -432,14 +440,16 @@ if __name__ == "__main__":
     print(f"Original size: {test_weights.size * 2 / (1024**2):.1f} MB (FP16)")
     
     # Quantize
-    q_weights, scales, zeros = quantizer.quantize_weights(test_weights)
+    q_weights, q_meta = quantizer.quantize_weights(test_weights)
+    scales = q_meta['scale']
+    zeros = q_meta['zero']
     print(f"Quantized weights shape: {q_weights.shape}")
     quantized_size = (q_weights.size * 0.5 + (scales.size + zeros.size) * 2) / (1024**2)
     print(f"Quantized size: {quantized_size:.1f} MB (INT4 + FP16 scales)")
     print(f"Compression ratio: {(test_weights.size * 2 / (1024**2)) / quantized_size:.2f}x")
-    
+
     # Dequantize and check error
-    dequantized = quantizer.dequantize_weights(q_weights, scales, zeros)
+    dequantized = quantizer.dequantize_weights(q_weights, q_meta)
     error = mx.mean((test_weights - dequantized) ** 2)
     print(f"Reconstruction MSE: {error.item():.6f}")
     
