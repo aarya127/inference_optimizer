@@ -1,0 +1,246 @@
+# Tensor Parallelism Simulation Configuration for Single-GPU M3
+
+# Overview
+# --------
+# Since M3 is a single-GPU system, we cannot perform real multi-GPU Tensor Parallelism (TP).
+# Instead, we simulate TP communication overhead by injecting artificial delays at 
+# synchronization points (All-Reduce operations).
+
+simulation:
+  enabled: true
+  purpose: "Model multi-GPU TP latency on single-GPU for controller training"
+  
+  # TP Configuration
+  tensor_parallel_size: 2  # Simulate 2-way TP
+  
+  # Communication Model
+  communication:
+    backend: "simulated_nccl"
+    topology: "nvlink"  # Simulate NVLink interconnect
+    
+    # Latency model for All-Reduce operations
+    all_reduce_latency:
+      base_latency_us: 50          # Base synchronization overhead
+      per_byte_latency_ns: 10      # Bandwidth: ~100 GB/s (NVLink)
+      synchronization_overhead_us: 20  # Barrier/coordination overhead
+      
+    # Example calculation for typical all-reduce:
+    # 4096 hidden_dim * 2 bytes (fp16) = 8KB tensor
+    # Latency = 50us + (8KB * 1000 bytes/KB * 10 ns) + 20us = 150us
+    
+  # Synchronization Points in Vision-Language Models
+  sync_points:
+    # Vision Encoder (CLIP ViT-L/14)
+    vision_encoder:
+      num_layers: 24
+      operations_per_layer:
+        - "Q/K/V projection all-reduce"      # After attention projections
+        - "Attention output all-reduce"       # After attention
+        - "FFN intermediate all-reduce"       # After first FFN layer
+        - "FFN output all-reduce"             # After second FFN layer
+        - "Layer norm sync"                   # Synchronization for stability
+      
+      syncs_per_layer: 5
+      total_syncs: 120  # 24 layers * 5 syncs
+      
+    # Multimodal Projection Layer
+    projection_layer:
+      syncs: 2  # Input sync + output sync
+      
+    # Language Model (Vicuna-7B / LLaMA-2-7B)
+    language_model:
+      num_layers: 32
+      operations_per_layer:
+        - "Q/K/V projection all-reduce"
+        - "Attention output all-reduce"
+        - "FFN gate/up all-reduce"
+        - "FFN down all-reduce"
+      
+      syncs_per_layer: 4
+      total_syncs: 128  # 32 layers * 4 syncs
+      
+      # Note: Language model syncs happen per-token during generation
+      # For prefill (processing image + prompt), all syncs happen once
+      # For decode (generating tokens), syncs happen per token
+    
+    # Total synchronization points
+    total_sync_points:
+      prefill_phase: 122  # Vision (120) + Projection (2) + Language (once for prompt)
+      decode_per_token: 4  # Language model syncs per generated token
+      
+  # Simulation Strategy
+  strategy:
+    method: "artificial_delay_injection"
+    
+    # When to inject delays
+    injection_points:
+      - "After linear layer forward pass (before activation)"
+      - "After attention output projection"
+      - "After FFN sublayers"
+      
+    # How to inject delays
+    implementation:
+      # Python implementation using time.sleep (microseconds)
+      simple: "time.sleep(latency_us / 1e6)"
+      
+      # MLX implementation using synchronization
+      mlx: "mx.eval(result); time.sleep(latency_us / 1e6)"
+      
+      # More accurate: busy-wait on GPU
+      accurate: "mx.synchronize(); busy_wait(latency_us)"
+      
+    # Validation approach
+    validation:
+      - "Measure end-to-end latency with/without simulation"
+      - "Compare simulated latency to published 2xGPU benchmarks"
+      - "Target: ±15% accuracy vs real multi-GPU"
+
+# Simulation Parameters
+parameters:
+  # Tensor sizes for different layers
+  tensor_sizes:
+    vision_encoder:
+      hidden_dim: 1024
+      num_heads: 16
+      head_dim: 64
+      intermediate_dim: 4096
+      
+      # Bytes per all-reduce (fp16)
+      qkv_projection_bytes: 6144    # 3 * 1024 * 2
+      attention_output_bytes: 2048  # 1024 * 2
+      ffn_intermediate_bytes: 8192  # 4096 * 2
+      ffn_output_bytes: 2048        # 1024 * 2
+      
+    language_model:
+      hidden_dim: 4096
+      num_heads: 32
+      head_dim: 128
+      intermediate_dim: 11008
+      
+      # Bytes per all-reduce (fp16)
+      qkv_projection_bytes: 24576   # 3 * 4096 * 2
+      attention_output_bytes: 8192  # 4096 * 2
+      ffn_gate_up_bytes: 44032      # 2 * 11008 * 2
+      ffn_down_bytes: 8192          # 4096 * 2
+  
+  # Calculated latencies per operation (microseconds)
+  operation_latencies:
+    vision_encoder:
+      qkv_projection: 131      # 50 + 6144*10/1000 + 20
+      attention_output: 91     # 50 + 2048*10/1000 + 20
+      ffn_intermediate: 152    # 50 + 8192*10/1000 + 20
+      ffn_output: 91           # 50 + 2048*10/1000 + 20
+      layer_norm_sync: 70      # Base + sync overhead
+      per_layer_total: 534     # Sum of above
+      
+    language_model:
+      qkv_projection: 316      # 50 + 24576*10/1000 + 20
+      attention_output: 152    # 50 + 8192*10/1000 + 20
+      ffn_gate_up: 510         # 50 + 44032*10/1000 + 20
+      ffn_down: 152            # 50 + 8192*10/1000 + 20
+      per_layer_total: 1130    # Sum of above
+      
+  # End-to-end estimates
+  end_to_end_latency_ms:
+    vision_encoder_prefill: 12.8   # 24 layers * 534 us / 1000
+    projection_layer: 0.2          # 2 syncs * ~100 us / 1000
+    language_prefill_64_tokens: 2.3  # 32 layers * 70 us / 1000 (simplified)
+    language_decode_per_token: 1.1 # 32 layers * ~35 us / 1000
+    
+    # Total for typical inference
+    # Image + 64 token prompt + 128 token generation
+    total_prefill: 15.3            # Vision + Projection + Language prefill
+    total_decode_128_tokens: 140.8 # 128 * 1.1 ms
+    grand_total: 156.1             # Prefill + Decode
+
+# Implementation Classes
+implementation:
+  class_name: "TPSimulator"
+  
+  methods:
+    - name: "inject_delay"
+      description: "Inject artificial delay at sync point"
+      parameters:
+        - tensor_size_bytes
+        - operation_type
+      
+    - name: "simulate_all_reduce"
+      description: "Simulate all-reduce operation with delay"
+      
+    - name: "get_sync_latency"
+      description: "Calculate latency for given tensor size"
+      
+    - name: "enable/disable"
+      description: "Turn simulation on/off for A/B testing"
+
+# Validation Plan
+validation:
+  baseline_measurements:
+    - metric: "TTFT without simulation"
+      target: "~300ms"
+      description: "Single-GPU baseline time-to-first-token"
+      
+    - metric: "TTFT with simulation"
+      target: "~456ms"
+      description: "Simulated 2xGPU TP time-to-first-token (+156ms)"
+      
+    - metric: "TBT without simulation"
+      target: "~35ms"
+      description: "Single-GPU time-between-tokens"
+      
+    - metric: "TBT with simulation"
+      target: "~36ms"
+      description: "Simulated 2xGPU TP time-between-tokens (+1.1ms)"
+  
+  comparison_targets:
+    - reference: "H100 2xGPU with TP=2"
+      expected_overhead_ms: "~150-200ms for TTFT"
+      
+    - reference: "Published vLLM benchmarks"
+      source: "vLLM paper, Table 3"
+      
+  acceptance_criteria:
+    - "Simulated overhead within ±15% of published numbers"
+    - "Consistent overhead across different prompt lengths"
+    - "Negligible performance impact when simulation disabled"
+
+# Usage Example
+usage_example: |
+  # Initialize simulator
+  simulator = TPSimulator(
+      tp_size=2,
+      base_latency_us=50,
+      per_byte_latency_ns=10
+  )
+  
+  # Enable simulation
+  simulator.enable()
+  
+  # During model forward pass
+  for layer in model.layers:
+      # ... compute attention ...
+      output = attention(x)
+      
+      # Simulate TP all-reduce
+      output = simulator.simulate_all_reduce(
+          output, 
+          operation="attention_output"
+      )
+      
+      # ... continue forward pass ...
+
+# Expected Impact on Controller Training
+controller_training:
+  benefit: |
+    By simulating TP overhead, the adaptive controller learns to account for
+    communication costs when making batching/scheduling decisions, even though
+    we're training on single-GPU hardware.
+    
+  cost_model_learning:
+    - "Controller learns that vision encoding is bottleneck (12.8ms overhead)"
+    - "Controller learns that per-token decode has minimal overhead (1.1ms)"
+    - "Controller can optimize for this asymmetry in multi-GPU scenarios"
+    
+  transfer_to_real_multi_gpu:
+    accuracy: "Expected ±15% accuracy"
+    note: "Real hardware will have variance, but patterns should transfer"

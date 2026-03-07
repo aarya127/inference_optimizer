@@ -1,0 +1,39 @@
+"""
+AMIO Phase 0 - Requirements File
+
+Core dependencies for Adaptive Multimodal Inference Optimizer
+Designed for Apple Silicon M3 with MLX framework
+"""
+
+# Core MLX Framework (Apple Silicon)
+mlx>=0.10.0
+mlx-lm>=0.10.0
+
+# Optional: Vision-Language support (may require manual build)
+# mlx-vlm>=0.1.0
+
+# Numerical Computing
+numpy>=1.24.0,<2.0.0
+
+# Image Processing
+pillow>=10.0.0
+
+# Model Loading and Tokenization
+transformers>=4.40.0
+huggingface-hub>=0.20.0
+
+# System Monitoring
+psutil>=5.9.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+packaging>=23.0
+tqdm>=4.65.0
+
+# Development Tools (optional)
+pytest>=7.4.0
+black>=23.0.0
+ruff>=0.1.0
