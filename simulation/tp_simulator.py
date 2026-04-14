@@ -6,13 +6,30 @@ artificial delays at synchronization points (All-Reduce operations).
 
 This allows training an adaptive controller on single-GPU hardware that
 understands multi-GPU communication costs.
+
+Phase 3 extensions:
+  - ParallelismMode enum (TP / DP / HYBRID)
+  - Analytical cost functions — compute_tp_cost(), compute_dp_cost()
+  - compare_parallelism_modes() returning recommended mode + gain %
 """
 
 import time
-import mlx.core as mx
-from typing import Dict, Optional, List
-from dataclasses import dataclass
+import math
+import sys
+from typing import Dict, Optional, List, Tuple, Any
+from dataclasses import dataclass, field
 from enum import Enum
+
+# mlx is only required for the injection-based simulation (Phase 0 code).
+# The Phase 3 analytical functions do not need it.
+try:
+    import mlx.core as mx
+    _MX_ARRAY = mx.array
+    _MLX_AVAILABLE = True
+except ImportError:
+    mx = None  # type: ignore[assignment]
+    _MX_ARRAY = Any  # type: ignore[assignment]
+    _MLX_AVAILABLE = False
 
 
 class OperationType(Enum):
@@ -23,6 +40,249 @@ class OperationType(Enum):
     FFN_OUTPUT = "ffn_output"
     LAYER_NORM = "layer_norm"
     PROJECTION = "projection"
+
+
+class ParallelismMode(Enum):
+    """Parallelism strategy for inference"""
+    TP = "tensor_parallel"        # Split weight matrices across devices/SMs
+    DP = "data_parallel"          # Each device/SM processes different crop
+    HYBRID = "hybrid"             # TP for LM, DP for vision encoder crops
+
+
+@dataclass
+class ParallelismCostResult:
+    """Result of a TP vs DP cost comparison"""
+    mode: ParallelismMode
+    t_compute_ms: float
+    t_communication_ms: float
+    t_total_ms: float
+    n_sync_points: int
+    throughput_gain_pct: float        # vs naive sequential baseline
+    notes: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Analytical cost functions (no actual MLX execution required)
+# ---------------------------------------------------------------------------
+
+# SmolVLM / SigLIP vision encoder configuration
+SIGLIP_N_LAYERS = 27          # SigLIP-So400M depth (SmolVLM uses)
+SIGLIP_HIDDEN_DIM = 1152      # SigLIP hidden dimension
+SIGLIP_SYNC_PER_LAYER = 5     # QKV, attn-out, FFN-up, FFN-down, layernorm
+
+# SmolVLM language model configuration
+LM_N_LAYERS = 24              # Qwen2-style LM depth
+LM_HIDDEN_DIM = 2048          # Calibrated in Phase 2
+LM_SYNC_PER_LAYER = 4         # QKV, attn-out, FFN-gate/up, FFN-down
+
+# M3 hardware constants
+M3_BANDWIDTH_GBps = 100.0     # Unified memory bandwidth
+M3_SYNC_LATENCY_us = 50.0     # Base all-reduce / barrier overhead (µs)
+M3_SYNC_OVERHEAD_us = 20.0    # Extra per-sync coordination overhead (µs)
+
+# Phase 2 calibrated baseline
+BASELINE_T_VISION_MS = 5991.0   # T_vision at 24 crops, sequential
+BASELINE_T_LM_MS = 2492.0       # T_lm_prefill at N=1548 tokens
+BASELINE_N_CROPS = 24
+
+
+def _sync_cost_us(tensor_bytes: int,
+                  base_us: float = M3_SYNC_LATENCY_us,
+                  overhead_us: float = M3_SYNC_OVERHEAD_us,
+                  bandwidth_GBps: float = M3_BANDWIDTH_GBps) -> float:
+    """Latency (µs) for a single All-Reduce of `tensor_bytes` bytes."""
+    bandwidth_us = (tensor_bytes / (bandwidth_GBps * 1e9)) * 1e6
+    return base_us + bandwidth_us + overhead_us
+
+
+def compute_tp_cost(
+    t_compute_ms: float,
+    n_layers: int,
+    hidden_dim: int,
+    sync_per_layer: int,
+    seq_len: int = 1548,
+    tp_size: int = 2,
+) -> ParallelismCostResult:
+    """
+    Analytical cost of Tensor-Parallel execution.
+
+    TP shards every weight matrix across `tp_size` workers.  After every
+    collective op, an All-Reduce is needed.  The payload of each All-Reduce
+    is proportional to hidden_dim * seq_len (FP16 = 2 bytes).
+
+    Parameters
+    ----------
+    t_compute_ms : baseline sequential compute time (ms)
+    n_layers     : number of transformer layers
+    hidden_dim   : model hidden dimension
+    sync_per_layer: number of All-Reduce calls per layer
+    seq_len      : sequence length at this stage
+    tp_size      : TP degree (set to 2 for M3 simulation)
+
+    Returns
+    -------
+    ParallelismCostResult
+    """
+    tensor_bytes = hidden_dim * seq_len * 2  # FP16
+    cost_per_sync_us = _sync_cost_us(tensor_bytes)
+    n_sync_total = n_layers * sync_per_layer
+    t_comm_ms = (n_sync_total * cost_per_sync_us) / 1000.0
+
+    # TP splits compute evenly when weight matrices are column/row sharded,
+    # so theoretical compute ≈ t_compute_ms / tp_size, but communication
+    # overhead is added back.
+    t_total_ms = t_compute_ms / tp_size + t_comm_ms
+    gain_pct = (t_compute_ms - t_total_ms) / t_compute_ms * 100.0
+
+    return ParallelismCostResult(
+        mode=ParallelismMode.TP,
+        t_compute_ms=t_compute_ms / tp_size,
+        t_communication_ms=t_comm_ms,
+        t_total_ms=t_total_ms,
+        n_sync_points=n_sync_total,
+        throughput_gain_pct=gain_pct,
+        notes=(f"TP-{tp_size}: {n_sync_total} sync pts, "
+               f"{t_comm_ms:.1f} ms comm overhead"),
+    )
+
+
+def compute_dp_cost(
+    t_compute_ms: float,
+    n_crops: int,
+    n_workers: int = 2,
+    hidden_dim: int = SIGLIP_HIDDEN_DIM,
+    tokens_per_crop: int = 256,
+) -> ParallelismCostResult:
+    """
+    Analytical cost of Data-Parallel execution over vision crops.
+
+    In DP mode each worker processes a disjoint subset of crops
+    (n_crops / n_workers each).  Results are fused with a single
+    All-Gather whose payload is all crop embeddings combined.
+
+    Parameters
+    ----------
+    t_compute_ms  : baseline sequential compute time (ms) for ALL crops
+    n_crops       : number of image crops to process
+    n_workers     : DP degree (number of parallel workers / SMs partitions)
+    hidden_dim    : encoder output hidden dimension
+    tokens_per_crop: patch tokens emitted per crop
+
+    Returns
+    -------
+    ParallelismCostResult
+    """
+    all_gather_bytes = n_crops * tokens_per_crop * hidden_dim * 2  # FP16
+    t_comm_ms = _sync_cost_us(all_gather_bytes) / 1000.0  # 1 AllGather
+
+    # Each worker handles ⌈crops / workers⌉ crops in parallel
+    crops_per_worker = math.ceil(n_crops / n_workers)
+    # Compute scales linearly with crop count
+    t_parallel_compute_ms = t_compute_ms * (crops_per_worker / n_crops)
+    t_total_ms = t_parallel_compute_ms + t_comm_ms
+
+    gain_pct = (t_compute_ms - t_total_ms) / t_compute_ms * 100.0
+
+    return ParallelismCostResult(
+        mode=ParallelismMode.DP,
+        t_compute_ms=t_parallel_compute_ms,
+        t_communication_ms=t_comm_ms,
+        t_total_ms=t_total_ms,
+        n_sync_points=1,   # single AllGather
+        throughput_gain_pct=gain_pct,
+        notes=(f"DP-{n_workers}: {crops_per_worker} crops/worker, "
+               f"1 AllGather ({all_gather_bytes/1024:.1f} KB)"),
+    )
+
+
+def compare_parallelism_modes(
+    t_vision_ms: float = BASELINE_T_VISION_MS,
+    t_lm_ms: float = BASELINE_T_LM_MS,
+    n_crops: int = BASELINE_N_CROPS,
+    n_workers: int = 2,
+    tp_size: int = 2,
+    seq_len: int = 1548,
+) -> Dict[str, ParallelismCostResult]:
+    """
+    Compare TP, DP, and HYBRID parallelism modes analytically.
+
+    Returns a dict with keys 'TP', 'DP', 'HYBRID' and as a bonus,
+    'recommended' pointing to the lowest-latency option.
+    """
+    # --- TP for vision encoder ---
+    tp_vision = compute_tp_cost(
+        t_compute_ms=t_vision_ms,
+        n_layers=SIGLIP_N_LAYERS,
+        hidden_dim=SIGLIP_HIDDEN_DIM,
+        sync_per_layer=SIGLIP_SYNC_PER_LAYER,
+        seq_len=n_crops * 256,   # approximate total patch tokens
+        tp_size=tp_size,
+    )
+    # TP for LM
+    tp_lm = compute_tp_cost(
+        t_compute_ms=t_lm_ms,
+        n_layers=LM_N_LAYERS,
+        hidden_dim=LM_HIDDEN_DIM,
+        sync_per_layer=LM_SYNC_PER_LAYER,
+        seq_len=seq_len,
+        tp_size=tp_size,
+    )
+    tp_total = ParallelismCostResult(
+        mode=ParallelismMode.TP,
+        t_compute_ms=tp_vision.t_compute_ms + tp_lm.t_compute_ms,
+        t_communication_ms=tp_vision.t_communication_ms + tp_lm.t_communication_ms,
+        t_total_ms=tp_vision.t_total_ms + tp_lm.t_total_ms,
+        n_sync_points=tp_vision.n_sync_points + tp_lm.n_sync_points,
+        throughput_gain_pct=(
+            (t_vision_ms + t_lm_ms - tp_vision.t_total_ms - tp_lm.t_total_ms)
+            / (t_vision_ms + t_lm_ms) * 100.0
+        ),
+        notes="TP applied to both vision encoder and LM",
+    )
+
+    # --- DP for vision crops only ---
+    dp_vision = compute_dp_cost(
+        t_compute_ms=t_vision_ms,
+        n_crops=n_crops,
+        n_workers=n_workers,
+        hidden_dim=SIGLIP_HIDDEN_DIM,
+    )
+    dp_total = ParallelismCostResult(
+        mode=ParallelismMode.DP,
+        t_compute_ms=dp_vision.t_compute_ms + t_lm_ms,
+        t_communication_ms=dp_vision.t_communication_ms,
+        t_total_ms=dp_vision.t_total_ms + t_lm_ms,
+        n_sync_points=1,
+        throughput_gain_pct=(
+            (t_vision_ms + t_lm_ms - dp_vision.t_total_ms - t_lm_ms)
+            / (t_vision_ms + t_lm_ms) * 100.0
+        ),
+        notes="DP over vision crops; LM runs sequentially after",
+    )
+
+    # --- HYBRID: DP for vision, TP for LM ---
+    hybrid_total = ParallelismCostResult(
+        mode=ParallelismMode.HYBRID,
+        t_compute_ms=dp_vision.t_compute_ms + tp_lm.t_compute_ms,
+        t_communication_ms=dp_vision.t_communication_ms + tp_lm.t_communication_ms,
+        t_total_ms=dp_vision.t_total_ms + tp_lm.t_total_ms,
+        n_sync_points=1 + tp_lm.n_sync_points,
+        throughput_gain_pct=(
+            (t_vision_ms + t_lm_ms - dp_vision.t_total_ms - tp_lm.t_total_ms)
+            / (t_vision_ms + t_lm_ms) * 100.0
+        ),
+        notes="DP vision crops + TP language model",
+    )
+
+    results = {
+        "TP": tp_total,
+        "DP": dp_total,
+        "HYBRID": hybrid_total,
+    }
+    best_key = min(results, key=lambda k: results[k].t_total_ms)
+    results["recommended"] = results[best_key]
+
+    return results
 
 
 @dataclass
@@ -62,6 +322,8 @@ class TPSimulator:
         
     def enable(self):
         """Enable TP simulation"""
+        if not _MLX_AVAILABLE:
+            raise RuntimeError("mlx is not installed; TP injection simulation requires mlx.")
         self.enabled = True
         print("✅ TP simulation enabled")
         
@@ -111,10 +373,10 @@ class TPSimulator:
     
     def simulate_all_reduce(
         self,
-        tensor: mx.array,
+        tensor: Any,
         operation: OperationType,
         layer_idx: int = 0
-    ) -> mx.array:
+    ) -> Any:
         """
         Simulate all-reduce operation with artificial delay
         
@@ -147,16 +409,17 @@ class TPSimulator:
         self.sync_history.append(sync_point)
         
         # Force evaluation and inject delay
-        mx.eval(tensor)
+        if _MLX_AVAILABLE:
+            mx.eval(tensor)
         time.sleep(latency_us / 1e6)  # Convert microseconds to seconds
         
         return tensor
     
     def simulate_vision_encoder_layer(
         self,
-        layer_output: mx.array,
+        layer_output: Any,
         layer_idx: int
-    ) -> mx.array:
+    ) -> Any:
         """
         Simulate all synchronization points in a vision encoder layer
         
@@ -195,9 +458,9 @@ class TPSimulator:
     
     def simulate_language_model_layer(
         self,
-        layer_output: mx.array,
+        layer_output: Any,
         layer_idx: int
-    ) -> mx.array:
+    ) -> Any:
         """
         Simulate synchronization points in a language model layer
         
@@ -303,7 +566,7 @@ class VisionEncoderWithTP:
         self.num_layers = num_layers
         self.tp_simulator = tp_simulator
         
-    def forward(self, x: mx.array) -> mx.array:
+    def forward(self, x: Any) -> Any:
         """Forward pass with TP simulation"""
         for layer_idx in range(self.num_layers):
             # Simulate layer computation
@@ -322,7 +585,7 @@ class LanguageModelWithTP:
         self.num_layers = num_layers
         self.tp_simulator = tp_simulator
         
-    def forward(self, x: mx.array) -> mx.array:
+    def forward(self, x: Any) -> Any:
         """Forward pass with TP simulation"""
         for layer_idx in range(self.num_layers):
             # Simulate TP overhead for this layer
@@ -335,12 +598,48 @@ class LanguageModelWithTP:
 
 
 if __name__ == "__main__":
-    """Test TP simulation"""
+    """Test TP simulation and Phase 3 parallelism cost comparison"""
     print("=" * 80)
-    print("AMIO Phase 0 - TP Simulation Test")
+    print("AMIO Phase 3 - TP Simulation + Parallelism Cost Comparison")
     print("=" * 80)
     print()
-    
+
+    # --- Analytical cost comparison (no MLX execution needed) ---
+    print("Analytical Parallelism Cost Comparison")
+    print("-" * 80)
+    results = compare_parallelism_modes(
+        t_vision_ms=BASELINE_T_VISION_MS,
+        t_lm_ms=BASELINE_T_LM_MS,
+        n_crops=BASELINE_N_CROPS,
+        n_workers=2,
+        tp_size=2,
+        seq_len=1548,
+    )
+    baseline_total = BASELINE_T_VISION_MS + BASELINE_T_LM_MS
+    print(f"  Baseline (sequential): {baseline_total:.1f} ms")
+    print()
+    for key in ("TP", "DP", "HYBRID"):
+        r = results[key]
+        print(f"  {key:6s}: compute={r.t_compute_ms:7.1f} ms  "
+              f"comm={r.t_communication_ms:7.1f} ms  "
+              f"total={r.t_total_ms:7.1f} ms  "
+              f"gain={r.throughput_gain_pct:+5.1f}%")
+        print(f"          {r.notes}")
+    print()
+    print(f"  ✅ Recommended: {results['recommended'].mode.value.upper()}")
+    print()
+
+    # --- Original TP injection test (Phase 0) ---
+    print("=" * 80)
+    print("AMIO Phase 0 - TP Injection Simulation Test")
+    print("=" * 80)
+    print()
+
+    if not _MLX_AVAILABLE:
+        print("  ⚠️  mlx not available — skipping injection simulation.")
+        print("     Install mlx (scope/venv_phase0) to run Phase 0 tests.")
+        sys.exit(0)
+
     # Create simulator
     config = CommunicationConfig(
         base_latency_us=50.0,
@@ -349,50 +648,50 @@ if __name__ == "__main__":
         tp_size=2
     )
     simulator = TPSimulator(config)
-    
+
     # Test latency calculations
     print("Operation Latencies (microseconds):")
     print("-" * 80)
     for op_type, latency in simulator.operation_latencies.items():
         print(f"  {op_type.value:25s}: {latency:6.1f} us")
-    
+
     print("\n")
-    
+
     # Test vision encoder simulation
     print("Simulating Vision Encoder (24 layers):")
     print("-" * 80)
     simulator.enable()
     simulator.reset_history()
-    
+
     # Dummy tensor
     x = mx.zeros((1, 576, 1024))  # [batch, patches, hidden_dim]
-    
+
     start_time = time.time()
     vision_encoder = VisionEncoderWithTP(num_layers=24, tp_simulator=simulator)
     x = vision_encoder.forward(x)
     elapsed_ms = (time.time() - start_time) * 1000
-    
+
     print(f"Elapsed time: {elapsed_ms:.1f} ms")
     print(f"Simulated overhead: {simulator.get_total_overhead_ms():.1f} ms")
-    
+
     print("\n")
-    
+
     # Test language model simulation
     print("Simulating Language Model (32 layers):")
     print("-" * 80)
     simulator.reset_history()
-    
+
     x = mx.zeros((1, 64, 4096))  # [batch, seq_len, hidden_dim]
-    
+
     start_time = time.time()
     language_model = LanguageModelWithTP(num_layers=32, tp_simulator=simulator)
     x = language_model.forward(x)
     elapsed_ms = (time.time() - start_time) * 1000
-    
+
     print(f"Elapsed time: {elapsed_ms:.1f} ms")
     print(f"Simulated overhead: {simulator.get_total_overhead_ms():.1f} ms")
-    
+
     # Print summary
     simulator.print_summary()
-    
-    print("\n✅ TP simulation test complete")
+
+    print("\n✅ Phase 3 tp_simulator extension complete")
