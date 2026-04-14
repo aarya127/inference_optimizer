@@ -24,12 +24,20 @@ Additionally, we model pipeline overlap — if the decode worker and vision
 worker can run truly concurrently on distinct SM partitions, the end-to-end
 latency is max(T_vision, T_decode) rather than T_vision + T_decode, saving
 significant wall-clock time.
+
+Phase 4 additions
+-----------------
+  BatchExpansionResult   — models how PagedAttention + W4A8 increase
+                           the maximum feasible batch size.
+  decode_starvation_analysis()  — finds the batch size ceiling where TBT
+                                  exceeds the 80 ms human-perceivable threshold.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import List
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +46,16 @@ from dataclasses import dataclass
 M3_TOTAL_SMs: int = 38           # Apple M3 GPU execution units
 M3_BANDWIDTH_GBps: float = 100.0 # Memory bandwidth
 M3_CLOCK_GHz: float = 1.398      # GPU clock (M3 base)
+
+# Phase 1 baseline facts (results.json)
+BASELINE_TBT_MS: float = 217.7           # ms/token at batch=1
+BASELINE_SPIKE_TBT_MS: float = 1926.5   # TBT spike at heavy load
+TBT_HUMAN_THRESHOLD_MS: float = 80.0    # human-perceivable lag boundary
+
+# KV cache constants (from results.json + Phase 4 analysis)
+KV_BYTES_PER_TOKEN_FP16: int = 110_592  # 2 × 24 layers × 1152 hidden × 2 B
+KV_POOL_BUDGET_MB: float = 5742.0       # M3 budget after weights + OS
+MAX_SEQ_LEN: int = 2048
 
 
 @dataclass
@@ -242,12 +260,191 @@ class SMOrchestrator:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: Decode Starvation Analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BatchExpansionResult:
+    """
+    Models how PagedAttention + W4A8 expand the maximum feasible batch size.
+
+    Attributes
+    ----------
+    strategy        : label ("baseline_fp16", "paged_fp16", "paged_w4a8", etc.)
+    kv_bytes_per_tok: KV cache bytes per token under this strategy
+    max_batch_by_mem: maximum batch that fits in KV pool (memory ceiling)
+    max_batch_by_tbt: maximum batch where TBT ≤ TBT_HUMAN_THRESHOLD_MS
+    effective_max_batch: min(max_batch_by_mem, max_batch_by_tbt)
+    tbt_at_max_batch_ms: predicted TBT at effective_max_batch
+    memory_efficiency_x: batch expansion vs baseline
+    """
+    strategy: str
+    kv_bytes_per_tok: int
+    max_batch_by_mem: int
+    max_batch_by_tbt: int
+    effective_max_batch: int
+    tbt_at_max_batch_ms: float
+    memory_efficiency_x: float
+    notes: str = ""
+
+
+@dataclass
+class DecodeStarvationResult:
+    """
+    Identifies at what batch size the decode worker is "starved" (TBT > 80 ms).
+    """
+    strategy: str
+    tbt_curve: List[float]       # ms/token for batch_sizes 1..N
+    starvation_at_batch: int     # first batch_size where TBT > threshold
+    tbt_at_starvation_ms: float
+    safe_batch_range: List[int]  # batch sizes where TBT ≤ threshold
+    throughput_tokens_per_s: List[float]  # tokens/s for each batch size
+
+
+def decode_starvation_analysis(
+    seq_len: int = 1548,
+    max_batch: int = 32,
+    tbt_threshold_ms: float = TBT_HUMAN_THRESHOLD_MS,
+    strategies: dict | None = None,
+) -> dict[str, DecodeStarvationResult]:
+    """
+    Determine the batch size ceiling for each quantisation + KV strategy.
+
+    TBT model:
+        T_decode ≈ base_tbt_ms × batch_size
+        (memory-bandwidth bound: each request adds one weight read pass)
+
+    Batch expansion from PagedAttention: no memory effect on TBT (KV reads
+    scale with batch anyway), but PagedAttention allows MORE requests to fit
+    in memory, so the effective concurrency is higher.
+
+    W4A8 reduces base_tbt_ms by the quantisation speedup factor.
+
+    Parameters
+    ----------
+    seq_len       : tokens per request
+    max_batch     : upper bound for sweep
+    tbt_threshold_ms : TBT SLA (default 80 ms)
+    strategies    : dict of {name: base_tbt_ms} overrides
+
+    Returns
+    -------
+    dict of strategy → DecodeStarvationResult
+    """
+    default_strategies = {
+        "baseline_fp16":  BASELINE_TBT_MS,         # 217.7 ms / tok
+        "paged_fp16":     BASELINE_TBT_MS,          # PagedAttention: same TBT, more capacity
+        "paged_w4a8_gar": BASELINE_TBT_MS / 3.2,   # ~3.2× speedup from W4A8+GAR
+        "paged_w4":       BASELINE_TBT_MS / 2.5,   # W4A16 only: ~2.5× speedup
+    }
+    strats = strategies or default_strategies
+    results: dict[str, DecodeStarvationResult] = {}
+
+    # KV bytes per token for each strategy
+    kv_bytes_map = {
+        "baseline_fp16":  KV_BYTES_PER_TOKEN_FP16,
+        "paged_fp16":     KV_BYTES_PER_TOKEN_FP16,
+        "paged_w4a8_gar": KV_BYTES_PER_TOKEN_FP16 // 2,  # A8 KV cache (FP8)
+        "paged_w4":       KV_BYTES_PER_TOKEN_FP16,
+    }
+
+    for name, base_tbt in strats.items():
+        kv_bpt = kv_bytes_map.get(name, KV_BYTES_PER_TOKEN_FP16)
+
+        tbt_curve: List[float] = []
+        throughput: List[float] = []
+        starvation_at = max_batch + 1  # assume no starvation by default
+        tbt_at_starv = 0.0
+        safe_batches: List[int] = []
+
+        for b in range(1, max_batch + 1):
+            # TBT scales linearly with batch in memory-bandwidth bound regime
+            tbt_b = base_tbt * b
+            tbt_curve.append(round(tbt_b, 2))
+            throughput.append(round(1000.0 / tbt_b * b, 3))  # tokens/s total
+
+            if tbt_b <= tbt_threshold_ms:
+                safe_batches.append(b)
+            elif starvation_at > max_batch:
+                starvation_at = b
+                tbt_at_starv = tbt_b
+
+        results[name] = DecodeStarvationResult(
+            strategy=name,
+            tbt_curve=tbt_curve,
+            starvation_at_batch=starvation_at if starvation_at <= max_batch else -1,
+            tbt_at_starvation_ms=round(tbt_at_starv, 2),
+            safe_batch_range=safe_batches,
+            throughput_tokens_per_s=throughput,
+        )
+
+    return results
+
+
+def batch_expansion_summary(
+    seq_len: int = 1548,
+) -> List[BatchExpansionResult]:
+    """
+    Return a BatchExpansionResult for each strategy showing how PagedAttention
+    + W4A8 expand the feasible batch size ceiling on M3.
+    """
+    pool_bytes = KV_POOL_BUDGET_MB * (1024 ** 2)
+    baseline_bpt = KV_BYTES_PER_TOKEN_FP16
+
+    strategies = [
+        # (label, kv_bpt, base_tbt_ms)
+        ("Contiguous FP16", baseline_bpt,         BASELINE_TBT_MS),
+        ("Paged FP16",      baseline_bpt,         BASELINE_TBT_MS),
+        ("Paged W4 KV",     baseline_bpt // 4,    BASELINE_TBT_MS),
+        ("Paged W4A8+GAR",  baseline_bpt // 2,    BASELINE_TBT_MS / 3.2),
+    ]
+
+    baseline_max_batch_mem = int(
+        pool_bytes / (baseline_bpt * seq_len + baseline_bpt * MAX_SEQ_LEN)
+    )
+    # Simple contiguous uses max_seq_len allocation always
+    contiguous_max_batch_mem = int(
+        pool_bytes / (baseline_bpt * MAX_SEQ_LEN)
+    )
+
+    results = []
+    for label, kv_bpt, base_tbt in strategies:
+        if "Contiguous" in label:
+            max_by_mem = contiguous_max_batch_mem
+        else:
+            # Paged: only allocate for actual seq_len, not max
+            max_by_mem = int(pool_bytes / (kv_bpt * seq_len))
+
+        max_by_tbt = max(1, int(TBT_HUMAN_THRESHOLD_MS / base_tbt))
+        eff = min(max_by_mem, max_by_tbt)
+        tbt_at_eff = base_tbt * eff
+        # Memory efficiency = batch capacity gain vs contiguous baseline (memory only)
+        mem_eff_x = round(max_by_mem / max(contiguous_max_batch_mem, 1), 2)
+
+        results.append(BatchExpansionResult(
+            strategy=label,
+            kv_bytes_per_tok=kv_bpt,
+            max_batch_by_mem=max_by_mem,
+            max_batch_by_tbt=max_by_tbt,
+            effective_max_batch=eff,
+            tbt_at_max_batch_ms=round(tbt_at_eff, 2),
+            memory_efficiency_x=mem_eff_x,
+            notes=(
+                f"{kv_bpt//1024}KB/tok KV, "
+                f"TBT={base_tbt:.1f}ms/tok"
+            ),
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("AMIO Phase 3 — SM Orchestrator Self-Test")
+    print("AMIO Phase 3 + 4 — SM Orchestrator Self-Test")
     print("=" * 70)
 
     orchestrator = SMOrchestrator(
@@ -271,4 +468,42 @@ if __name__ == "__main__":
         alloc = orchestrator.allocate(n_pending_decode=n_pending, n_crops=n_crops)
         orchestrator.print_allocation(alloc)
 
-    print("\n✅ SM orchestrator self-test complete")
+    # --- Phase 4: Batch expansion ---
+    print("\n" + "=" * 70)
+    print("Phase 4 — Batch Expansion: PagedAttention + W4A8")
+    print("=" * 70)
+    print(f"\n  Baseline TBT: {BASELINE_TBT_MS:.1f} ms/tok  |  "
+          f"TBT threshold: {TBT_HUMAN_THRESHOLD_MS:.0f} ms  |  "
+          f"KV pool: {KV_POOL_BUDGET_MB:.0f} MB  |  seq_len=1548")
+    print()
+    print(f"  {'Strategy':<22} {'KVbpt':>6} {'MaxBatch(mem)':>13} "
+          f"{'MaxBatch(TBT)':>13} {'EffectiveBatch':>14} {'TBT@eff':>7} {'Gain':>5}")
+    print("  " + "-" * 80)
+    for r in batch_expansion_summary():
+        print(
+            f"  {r.strategy:<22} "
+            f"{r.kv_bytes_per_tok//1024:>4}KB  "
+            f"{r.max_batch_by_mem:>13}  "
+            f"{r.max_batch_by_tbt:>13}  "
+            f"{r.effective_max_batch:>14}  "
+            f"{r.tbt_at_max_batch_ms:>6.1f}  "
+            f"{r.memory_efficiency_x:>4.1f}×"
+        )
+
+    # --- Phase 4: Decode starvation ---
+    print()
+    print("  Decode Starvation Analysis (batch_size → TBT)")
+    print(f"  {'Strategy':<22} {'StarveAt':>8} {'TBT@starve':>10} {'SafeBatches':>12}")
+    print("  " + "-" * 56)
+    starvation = decode_starvation_analysis(max_batch=16)
+    for name, r in starvation.items():
+        starve = r.starvation_at_batch if r.starvation_at_batch > 0 else ">16"
+        safe = str(r.safe_batch_range) if r.safe_batch_range else "none"
+        print(
+            f"  {name:<22} "
+            f"{str(starve):>8}  "
+            f"{r.tbt_at_starvation_ms:>9.1f}  "
+            f"{safe}"
+        )
+
+    print("\n✅ SM orchestrator (Phase 3 + 4) self-test complete")
