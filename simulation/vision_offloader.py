@@ -31,7 +31,7 @@ Zero-overhead condition (M3):
     B = 100 GB/s
     T_forward_layer = 5991 ms / 27 = 222 ms
     Max layer size for zero overhead = 100e9 × 0.222 = 22.2 GB >> 2.65 MB
-    ✅ M3 satisfies the zero-overhead condition with massive margin.
+    M3 satisfies the zero-overhead condition with massive margin.
 """
 
 from __future__ import annotations
@@ -288,7 +288,7 @@ if __name__ == "__main__":
     print(f"  Layer size     : {cond['layer_size_mb']:.3f} MB")
     print(f"  BW required    : {cond['bw_required_GBps']:.4f} GB/s")
     print(f"  BW available   : {cond['bw_available_GBps']} GB/s")
-    print(f"  Margin         : {cond['margin_x']}×   ✅ {cond['notes']}")
+    print(f"  Margin         : {cond['margin_x']}×   {cond['notes']}")
 
     # K sweep
     print(f"\nK physical layers sweep (W4 format):")
@@ -296,7 +296,7 @@ if __name__ == "__main__":
           f"{'Stall ms':>8}  {'Overhead%':>9}  {'Zero?':>5}")
     print("  " + "-" * 55)
     for r in sweep_k_values():
-        flag = "✅" if r.zero_overhead else "❌"
+        flag = "PASS" if r.zero_overhead else "FAIL"
         print(
             f"  {r.k_physical_layers:>3}  "
             f"{r.gpu_memory_mb:>7.2f}  "
@@ -308,4 +308,4 @@ if __name__ == "__main__":
         )
 
     print(f"\nRecommended: K=2  — {VisionOffloader(k_physical_layers=2).kv_headroom_freed_mb():.1f} MB freed for KV cache")
-    print("\n✅ Vision offloader self-test complete")
+    print("\nVision offloader self-test complete")

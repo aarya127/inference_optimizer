@@ -494,4 +494,4 @@ if __name__ == "__main__":
     print(f"  Throughput: {metrics.tbt.tokens_per_second:.1f} tok/s")
     print(f"  Memory Fragmentation: {metrics.fragmentation.fragmentation_percent:.1f}%")
     
-    print("\n✅ Metrics collection test complete")
+    print("\nMetrics collection test complete")

@@ -283,7 +283,7 @@ class TechStackValidator:
         print("-" * 80)
         
         for result in self.results:
-            status = "✅ PASS" if result.passed else "❌ FAIL"
+            status = "PASS" if result.passed else "FAIL"
             print(f"{status} | {result.check_name:20s} | {result.message}")
         
         print("-" * 80)
@@ -294,9 +294,9 @@ class TechStackValidator:
         print(f"\nSummary: {passed_count}/{total_count} checks passed")
         
         if passed_count == total_count:
-            print("✅ Tech stack is ready for Phase 0!")
+            print("Tech stack is ready for Phase 0!")
         else:
-            print("\n❌ Please fix the failed checks before proceeding.")
+            print("\nPlease fix the failed checks before proceeding.")
             print("\nInstallation instructions:")
             print("  pip install mlx>=0.10.0 mlx-lm mlx-vlm")
             print("  pip install numpy pillow transformers huggingface-hub")

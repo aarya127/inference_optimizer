@@ -137,7 +137,7 @@ class InferenceExecutionPlan:
     notes: str = ""
 
     def summary(self) -> str:
-        flag = "✅ PASS" if self.sla_pass else "❌ FAIL"
+        flag = "PASS" if self.sla_pass else "FAIL"
         lines = [
             "=" * 70,
             "AMIO Inference Execution Plan",
@@ -381,7 +381,7 @@ if __name__ == "__main__":
     results_table = []
     for label, res, n_pend in scenarios:
         p = engine.plan(resolution=res, n_pending_requests=n_pend, sla_budget_ms=500.0)
-        flag = "✅" if p.sla_pass else "❌"
+        flag = "PASS" if p.sla_pass else "FAIL"
         results_table.append((label, p, flag))
 
     # Compact table
@@ -406,4 +406,4 @@ if __name__ == "__main__":
     plan_512 = engine.plan(resolution=512, n_pending_requests=1, sla_budget_ms=500.0)
     print(plan_512.summary())
 
-    print("\n✅ Parallelism engine demonstration complete")
+    print("\nParallelism engine demonstration complete")

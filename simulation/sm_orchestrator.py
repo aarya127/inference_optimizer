@@ -506,4 +506,4 @@ if __name__ == "__main__":
             f"{safe}"
         )
 
-    print("\n✅ SM orchestrator (Phase 3 + 4) self-test complete")
+    print("\nSM orchestrator (Phase 3 + 4) self-test complete")

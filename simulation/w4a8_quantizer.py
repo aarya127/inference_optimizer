@@ -345,7 +345,7 @@ if __name__ == "__main__":
           f"{'SLA':>4}  {'MaxBatch':>8}")
     print("  " + "-" * 70)
     for key, r in results.items():
-        flag = "✅" if r.sla_tbt_pass else "❌"
+        flag = "PASS" if r.sla_tbt_pass else "FAIL"
         print(
             f"  {r.config.name:<18} "
             f"{r.weight_bytes_quantized/1e6:>5.0f}  "
@@ -377,4 +377,4 @@ if __name__ == "__main__":
     print(f"  Offline GAR pass: ~{overhead['total_gar_pass_s']:.0f} s  "
           f"(inference overhead: {overhead['inference_overhead_ms']} ms)")
     print()
-    print("✅ W4A8 quantiser analysis complete")
+    print("W4A8 quantiser analysis complete")

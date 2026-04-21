@@ -33,7 +33,7 @@ def main():
     last_error = None
 
     for model_id in MODEL_CANDIDATES:
-        print(f"📦 Loading model: {model_id}")
+        print(f"Loading model: {model_id}")
         print("   This may download model files on first run...")
         print()
         try:
@@ -41,26 +41,26 @@ def main():
             model, processor = load(model_id)
             load_time = time.time() - start_time
             loaded_model_id = model_id
-            print(f"✅ Model loaded successfully in {load_time:.2f}s")
+            print(f"Model loaded successfully in {load_time:.2f}s")
             print()
             break
         except Exception as e:
             last_error = e
-            print(f"⚠️ Failed to load {model_id}: {e}")
+            print(f"[WARN] Failed to load {model_id}: {e}")
             print("   Trying next candidate...\n")
 
     if model is None or processor is None:
-        print("❌ Could not load any candidate model.")
+        print("Could not load any candidate model.")
         print(f"Last error: {last_error}")
         return 1
 
-    print("📊 Model Statistics:")
+    print("Model Statistics:")
     print(f"   Model ID: {loaded_model_id}")
     print("   Quantization: pre-quantized checkpoint (4-bit expected)")
     print(f"   Device: {mx.default_device()}")
     print()
 
-    print("🧪 Testing inference...")
+    print("Testing inference...")
     test_prompt = "What is the capital of France? Answer in one short sentence."
 
     try:
@@ -83,14 +83,14 @@ def main():
         print()
 
         print("=" * 80)
-        print("✅ ALL TESTS PASSED")
+        print("ALL TESTS PASSED")
         print("=" * 80)
         print("Next steps:")
         print("  - Test with an image input")
         print("  - Measure TTFT and TBT in your metrics pipeline")
         return 0
     except Exception as e:
-        print(f"❌ Inference failed after successful load: {e}")
+        print(f"Inference failed after successful load: {e}")
         return 1
 
 if __name__ == "__main__":

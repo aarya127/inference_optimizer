@@ -325,12 +325,12 @@ class TPSimulator:
         if not _MLX_AVAILABLE:
             raise RuntimeError("mlx is not installed; TP injection simulation requires mlx.")
         self.enabled = True
-        print("✅ TP simulation enabled")
+        print("TP simulation enabled")
         
     def disable(self):
         """Disable TP simulation"""
         self.enabled = False
-        print("⏸️  TP simulation disabled")
+        print("TP simulation disabled")
         
     def _compute_operation_latencies(self) -> Dict[OperationType, float]:
         """Pre-compute latencies for common operation types"""
@@ -626,7 +626,7 @@ if __name__ == "__main__":
               f"gain={r.throughput_gain_pct:+5.1f}%")
         print(f"          {r.notes}")
     print()
-    print(f"  ✅ Recommended: {results['recommended'].mode.value.upper()}")
+    print(f"  Recommended: {results['recommended'].mode.value.upper()}")
     print()
 
     # --- Original TP injection test (Phase 0) ---
@@ -636,7 +636,7 @@ if __name__ == "__main__":
     print()
 
     if not _MLX_AVAILABLE:
-        print("  ⚠️  mlx not available — skipping injection simulation.")
+        print("  [WARN] mlx not available — skipping injection simulation.")
         print("     Install mlx (scope/venv_phase0) to run Phase 0 tests.")
         sys.exit(0)
 
@@ -694,4 +694,4 @@ if __name__ == "__main__":
     # Print summary
     simulator.print_summary()
 
-    print("\n✅ Phase 3 tp_simulator extension complete")
+    print("\nPhase 3 tp_simulator extension complete")

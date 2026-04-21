@@ -27,9 +27,9 @@ class Phase0Verifier:
         exists = full_path.exists()
         
         if exists:
-            print(f"  ✅ {filepath}")
+            print(f"  [OK] {filepath}")
         else:
-            print(f"  ❌ {filepath} - MISSING")
+            print(f"  [MISSING] {filepath}")
         
         self.checks_total += 1
         if exists:
@@ -150,21 +150,21 @@ class Phase0Verifier:
         print("=" * 80)
         
         if self.checks_passed == self.checks_total:
-            print("\n✅ Phase 0 foundation is COMPLETE!")
+            print("\nPhase 0 foundation is COMPLETE!")
             print("\nSuccess Criteria:")
-            print("  ✅ Directory structure created")
-            print("  ✅ Tech stack specification defined")
-            print("  ✅ 7B multimodal model configuration implemented")
-            print("  ✅ 4-bit quantization framework built")
-            print("  ✅ Single-GPU TP simulation created")
-            print("  ✅ Core performance metrics defined")
-            print("  ✅ SLA targets established")
-            print("  ✅ 1-page design document generated")
-            print("\n🚀 Ready to proceed to Phase 1: Adaptive Controller Development")
+            print("  Directory structure created")
+            print("  Tech stack specification defined")
+            print("  7B multimodal model configuration implemented")
+            print("  4-bit quantization framework built")
+            print("  Single-GPU TP simulation created")
+            print("  Core performance metrics defined")
+            print("  SLA targets established")
+            print("  1-page design document generated")
+            print("\nReady to proceed to Phase 1: Adaptive Controller Development")
             return True
         else:
             missing = self.checks_total - self.checks_passed
-            print(f"\n❌ Phase 0 incomplete: {missing} items missing")
+            print(f"\nPhase 0 incomplete: {missing} items missing")
             print("\nPlease ensure all components are properly created.")
             return False
 

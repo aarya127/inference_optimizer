@@ -118,7 +118,7 @@ def calibrate() -> dict:
                 trial_times.append(t)
                 print(".", end="", flush=True)
             except Exception as e:
-                print(f"✗({e})", end="", flush=True)
+                print(f"ERR({e})", end="", flush=True)
 
         if trial_times:
             mean_t = float(np.mean(trial_times))
@@ -131,7 +131,7 @@ def calibrate() -> dict:
                 trial_times=trial_times,
             ))
         else:
-            print("  ✗ ALL TRIALS FAILED")
+            print("  ALL TRIALS FAILED")
 
     if len(calibration_data) < 3:
         raise RuntimeError("Too few successful measurements to fit a polynomial.")
@@ -154,7 +154,7 @@ def calibrate() -> dict:
     print(f"  γ (quadratic) = {gamma:.6e}  ms/token²")
     print(f"  β (linear)    = {beta:.6f}  ms/token")
     print(f"  α (constant)  = {alpha:.2f}  ms")
-    print(f"  R²            = {r2:.4f}  {'✅' if r2 >= 0.95 else '⚠️  (below 0.95 threshold)'}")
+    print(f"  R²            = {r2:.4f}  {'PASS' if r2 >= 0.95 else 'WARN (below 0.95 threshold)'}")
 
     # ── Validate against Phase 1 ground truth ────────────────────────────────
     N_BASELINE = 1548
@@ -164,7 +164,7 @@ def calibrate() -> dict:
 
     print(f"\nValidation vs Phase 1 baseline (N={N_BASELINE}, T={T_BASELINE:.1f}ms):")
     print(f"  Predicted : {t_pred_baseline:.1f} ms")
-    print(f"  Error     : {error_pct:.1f}%  {'✅' if error_pct < 15 else '⚠️'}")
+    print(f"  Error     : {error_pct:.1f}%  {'PASS' if error_pct < 15 else 'WARN'}")
 
     # ── SLA-safe token count ──────────────────────────────────────────────────
     SLA_MS = 500.0
@@ -216,7 +216,7 @@ def main():
     with open(CALIB_RESULTS, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\n✅  Results saved → {CALIB_RESULTS}")
+    print(f"\nResults saved → {CALIB_RESULTS}")
     print("\nNext: run  python model_calibration/cost_model.py  to load these coefficients.")
 
 

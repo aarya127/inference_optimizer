@@ -91,7 +91,7 @@ DECODE_TBT_BASE_MS:     float = 87.7       # measured TBT at batch=1 (W4A8+GAR)
 DECODE_OVERHEAD_MS:     float = 83.75      # fixed per-step overhead (framework, Python)
 DECODE_BW_COST_MS:      float = 3.95       # bandwidth cost per request per step
 #   TBT(B) = DECODE_OVERHEAD_MS + DECODE_BW_COST_MS × B   ← weight-sharing model
-#   At B=1: 83.75 + 3.95 = 87.70 ms  ✓
+#   At B=1: 83.75 + 3.95 = 87.70 ms
 #   Implies weight bytes loaded once, KV traffic scales linearly with batch.
 
 VISION_BASE_MS:         float = 5991.0     # SigLIP full-encoder (Phase 1 baseline)
@@ -1029,9 +1029,9 @@ def print_comparison(m_sjf: SimMetrics, m_fcfs: SimMetrics, m_stat: SimMetrics) 
         ratio = continuous / static
         label = f"{ratio:.2f}×"
         if higher_is_better:
-            return label + (" ✅" if ratio > 1.0 else " ❌")
+            return label + (" PASS" if ratio > 1.0 else " FAIL")
         else:
-            return label + (" ✅" if ratio < 1.0 else " ❌")
+            return label + (" PASS" if ratio < 1.0 else " FAIL")
 
     header = (
         f"{'Metric':<38} {'Continuous SJF':>16} {'Continuous FCFS':>16} "
@@ -1142,9 +1142,9 @@ def print_comparison(m_sjf: SimMetrics, m_fcfs: SimMetrics, m_stat: SimMetrics) 
     tbt_sjf  = m_sjf.avg_tbt_ms
     tbt_stat = m_stat.avg_tbt_ms
     if tbt_sjf <= TBT_SLA_MS:
-        print(f"  ✅ Continuous SJF avg TBT = {tbt_sjf:.1f} ms ≤ {TBT_SLA_MS:.0f} ms SLA")
+        print(f"  [PASS] Continuous SJF avg TBT = {tbt_sjf:.1f} ms ≤ {TBT_SLA_MS:.0f} ms SLA")
     else:
-        print(f"  ⚠  Continuous SJF avg TBT = {tbt_sjf:.1f} ms > {TBT_SLA_MS:.0f} ms SLA  "
+        print(f"  [WARN] Continuous SJF avg TBT = {tbt_sjf:.1f} ms > {TBT_SLA_MS:.0f} ms SLA  "
               f"(Phase 5 continuous batching reduces tail latency; "
               f"batched decode TBT is a known trade-off vs single-request TBT)")
 
@@ -1164,10 +1164,10 @@ def print_starvation_analysis(m_sjf: SimMetrics, m_fcfs: SimMetrics) -> None:
           f"(closer to 1.0 = more uniform service)")
     print(f"    p99/p50 TTFT ratio (FCFS):  {p99_ratio_fcfs:.2f}")
     if p99_ratio < p99_ratio_fcfs:
-        print(f"    ✅ SJF reduces tail unfairness by "
+        print(f"    [PASS] SJF reduces tail unfairness by "
               f"{(p99_ratio_fcfs - p99_ratio)/p99_ratio_fcfs*100:.1f}%")
     else:
-        print(f"    ℹ  Starvation threshold ({STARVATION_THRESHOLD} bypasses) "
+        print(f"    [INFO] Starvation threshold ({STARVATION_THRESHOLD} bypasses) "
               f"prevents runaway unfairness for long requests.")
     print()
 
@@ -1194,7 +1194,7 @@ def _run_self_test() -> None:
     assert pool.free_blocks == 900
     pool.free(req_id=0)
     assert pool.free_blocks == 1000
-    print("  ✓ KV pool accounting")
+    print("  [OK] KV pool accounting")
 
     # ── Test 3: Request SJF key ──────────────────────────────────────────────
     short_req = Request(req_id=0, arrival_time_ms=0, n_visual_tokens=256,  max_output_tokens=32)
@@ -1203,7 +1203,7 @@ def _run_self_test() -> None:
     # Starvation promotion
     long_req.starvation_count = STARVATION_THRESHOLD
     assert long_req.sjf_key == 0.0, "Starvation promotion should set key = 0"
-    print("  ✓ Request SJF key + starvation promotion")
+    print("  [OK] Request SJF key + starvation promotion")
 
     # ── Test 4: Small simulation smoke test ──────────────────────────────────
     reqs   = generate_poisson_requests(n_requests=30, arrival_rate_rps=1.0, seed=0)
@@ -1212,7 +1212,7 @@ def _run_self_test() -> None:
     assert m.n_finished > 0, "Some requests should complete"
     assert m.gpu_utilization_pct >= 0.0
     assert m.throughput_req_s > 0.0
-    print(f"  ✓ Continuous-SJF smoke test: {m.n_finished}/{m.n_requests} done, "
+    print(f"  [OK] Continuous-SJF smoke test: {m.n_finished}/{m.n_requests} done, "
           f"util={m.gpu_utilization_pct:.1f}%, "
           f"p99_TTFT={m.p99_ttft_ms/1000:.1f}s")
 
@@ -1221,7 +1221,7 @@ def _run_self_test() -> None:
     engine2 = StaticBatchingEngine(reqs2, batch_size=10)
     m2     = engine2.run()
     assert m2.n_finished > 0
-    print(f"  ✓ Static-FCFS smoke test:  {m2.n_finished}/{m2.n_requests} done, "
+    print(f"  [OK] Static-FCFS smoke test:  {m2.n_finished}/{m2.n_requests} done, "
           f"util={m2.gpu_utilization_pct:.1f}%, "
           f"p99_TTFT={m2.p99_ttft_ms/1000:.1f}s")
 
@@ -1238,12 +1238,12 @@ def _run_self_test() -> None:
         f"Continuous p99 TTFT {c_m.p99_ttft_ms:.0f} ms should ≤ "
         f"Static {s_m.p99_ttft_ms:.0f} ms"
     )
-    print(f"  ✓ Continuous GPU util {c_m.gpu_utilization_pct:.1f}% ≥ "
+    print(f"  [OK] Continuous GPU util {c_m.gpu_utilization_pct:.1f}% ≥ "
           f"Static {s_m.gpu_utilization_pct:.1f}%  "
           f"| p99 TTFT: {c_m.p99_ttft_ms/1000:.1f}s vs {s_m.p99_ttft_ms/1000:.1f}s")
 
     print()
-    print("All Phase 5 self-tests PASSED ✅")
+    print("All Phase 5 self-tests PASSED")
     print()
 
 

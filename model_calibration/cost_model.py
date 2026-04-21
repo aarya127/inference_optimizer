@@ -22,7 +22,7 @@ Key finding: at N ≤ 1548, MLP layers (O(N)) dominate over attention (O(N²)).
 The practical scaling is almost purely linear (quadratic term is <2% at N=1548).
 
 Validation discrepancy (70.6% error) is EXPECTED:
-  Phase 1 T_prefill = T_vision_encoder + T_lm_prefill = 5991 + 2498 = 8489ms ✓
+  Phase 1 T_prefill = T_vision_encoder + T_lm_prefill = 5991 + 2498 = 8489ms
   Calibration only measures T_lm_prefill (vision encoder bypassed).
 """
 
@@ -449,7 +449,7 @@ if __name__ == "__main__":
     sla = model.find_sla_pruning_target(1548)
     print("\n3. SLA target (T_total ≤ 500ms):")
     if sla.get("blocking_component") == "vision_encoder":
-        print(f"   ✗  {sla['note']}")
+        print(f"   {sla['note']}")
     else:
         print(f"   LM tokens needed  : {sla['target_tokens']}")
         print(f"   Pruning ratio     : {sla['pruning_ratio']} ({sla['compression_ratio']}× compression)")

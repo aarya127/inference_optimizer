@@ -86,10 +86,10 @@ class LLaVAModel(MultimodalModel):
             # Load projection layer
             self._load_projection()
             
-            print("✅ Model loaded successfully")
+            print("Model loaded successfully")
             
         except Exception as e:
-            print(f"❌ Error loading model: {e}")
+            print(f"Error loading model: {e}")
             raise
     
     def _load_vision_encoder(self):
@@ -135,7 +135,7 @@ class LLaVAModel(MultimodalModel):
             print(f"    Layers: {self.language_model['num_layers']}")
             
         except Exception as e:
-            print(f"    ⚠️  Using placeholder language model: {e}")
+            print(f"    [WARN] Using placeholder language model: {e}")
     
     def _load_projection(self):
         """Load multimodal projection layer"""
@@ -234,7 +234,7 @@ class QwenVLModel(MultimodalModel):
         print(f"Quantization: {self.config.quantization_bits}-bit")
         
         # Placeholder for Phase 0
-        print("⚠️  Qwen-VL support is planned for Phase 1")
+        print("[WARN] Qwen-VL support is planned for Phase 1")
         print("   Using LLaVA as primary model for Phase 0")
         
     def encode_image(self, image: mx.array) -> mx.array:
@@ -378,6 +378,6 @@ if __name__ == "__main__":
         model = load_model(model_type="llava", quantization_bits=4)
         usage = model.memory_usage()
         print(f"\nMemory usage: {usage['total_peak']:.1f} MB ({usage['total_peak']/1024:.2f} GB)")
-        print("✅ Model loading test passed")
+        print("Model loading test passed")
     except Exception as e:
-        print(f"⚠️  Model loading test (expected in Phase 0): {e}")
+        print(f"[WARN] Model loading test (expected in Phase 0): {e}")

@@ -21,7 +21,7 @@ Hardware / model constants (derived from Phase 1 measurements)
   max_seq_len = 2048      (pre-allocation ceiling for contiguous backend)
   kv_per_tok  = 110,592 bytes/token (= 2 × 24 × 1152 × 2)
 
-Verification:  kv_per_tok × 2048 = 226,492,416 B = 216.0 MB  ✓  (matches results.json)
+Verification:  kv_per_tok × 2048 = 226,492,416 B = 216.0 MB  (matches results.json)
 """
 
 from __future__ import annotations
@@ -412,7 +412,7 @@ if __name__ == "__main__":
     print("  " + "-" * 65)
     pairs = compare_backends()
     for c, p in pairs:
-        match = "✅" if p.fragmentation_pct < 4.0 else "⚠️ "
+        match = "OK" if p.fragmentation_pct < 4.0 else "WARN"
         print(
             f"  {c.seq_len:>7}  "
             f"{c.kv_allocated_mb:>14.2f} MB  {c.fragmentation_pct:>10.1f}%  "
@@ -445,8 +445,8 @@ if __name__ == "__main__":
     ]
     for s, b, q in interesting:
         kv_mb = kv_cache_size_mb(s, b, quantization_bits=q)
-        flag = "✅" if kv_mb <= KV_POOL_BUDGET_MB else "❌"
+        flag = "PASS" if kv_mb <= KV_POOL_BUDGET_MB else "FAIL"
         print(f"  {s:>7}  {b:>5}  {q:>4}b  {kv_mb:>7.2f}  {flag}")
 
     print()
-    print("✅ KV manager self-test complete")
+    print("KV manager self-test complete")

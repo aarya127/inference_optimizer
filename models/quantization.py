@@ -277,7 +277,7 @@ class ModelQuantizer:
                     
                     num_quantized += 1
                     
-                    print(f"  ✅ Quantized: {name}")
+                    print(f"  Quantized: {name}")
                 else:
                     # Keep in FP16
                     weights = module.weight
@@ -285,7 +285,7 @@ class ModelQuantizer:
                     quantized_size += weights.size * 2
                     num_excluded += 1
                     
-                    print(f"  ⏭️  Excluded: {name}")
+                    print(f"  Excluded: {name}")
         
         # Convert to MB
         original_size_mb = original_size / (1024 ** 2)
@@ -301,7 +301,7 @@ class ModelQuantizer:
             quality_metrics={}
         )
         
-        print(f"\n📊 Quantization Summary:")
+        print(f"\nQuantization Summary:")
         print(f"  Original size: {original_size_mb:.1f} MB")
         print(f"  Quantized size: {quantized_size_mb:.1f} MB")
         print(f"  Compression: {compression_ratio:.2f}x")
@@ -453,4 +453,4 @@ if __name__ == "__main__":
     error = mx.mean((test_weights - dequantized) ** 2)
     print(f"Reconstruction MSE: {error.item():.6f}")
     
-    print("\n✅ Quantization framework test complete")
+    print("\nQuantization framework test complete")

@@ -259,15 +259,15 @@ def main():
         "model_weights_mb":   round(model_mem_mb, 1),
         "rss_after_load_mb":  round(mem_after_load, 1),
     }
-    print(f"✅ Loaded in {load_time_s:.1f}s  |  model Δmem: {model_mem_mb:.0f} MB\n")
+    print(f"Loaded in {load_time_s:.1f}s  |  model Δmem: {model_mem_mb:.0f} MB\n")
 
     # ── Download test image ────────────────────────────────────────────────
     print("Downloading test image...")
     try:
         base_image = download_image(IMAGE_URL)
-        print(f"✅ Image downloaded: {base_image.size}\n")
+        print(f"Image downloaded: {base_image.size}\n")
     except Exception as e:
-        print(f"⚠️  Download failed ({e}), generating synthetic image")
+        print(f"[WARN] Download failed ({e}), generating synthetic image")
         base_image = Image.fromarray(
             np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
 
@@ -311,7 +311,7 @@ def main():
                   f"KV={data['kv_cache_mb']:.2f}MB  "
                   f"frag={data['fragmentation_pct']}%")
         except Exception as e:
-            print(f"    ⚠️  Failed at {res}px: {e}")
+            print(f"    [WARN] Failed at {res}px: {e}")
 
     print()
 
@@ -330,7 +330,7 @@ def main():
         print(f"  Early (tok 1-20)  mean: {np.mean(tbt_latencies[:20]):.1f}ms")
         print(f"  Late  (tok 40-60) mean: {np.mean(tbt_latencies[40:]):.1f}ms")
     except Exception as e:
-        print(f"  ⚠️  TBT curve failed: {e}")
+        print(f"  [WARN] TBT curve failed: {e}")
     print()
 
     # ── 3. Batch Throughput + SLA sweep ────────────────────────────────────
@@ -342,11 +342,11 @@ def main():
         try:
             r = measure_batch_throughput(model, processor, img_512b, PROMPT, bs)
             results["batch_throughput"].append(r)
-            sla = "✅ PASS" if r["sla_pass"] else "❌ FAIL"
+            sla = "PASS" if r["sla_pass"] else "FAIL"
             print(f"  Batch={bs}  {r['tokens_per_sec']:.1f} tok/s  "
                   f"first_token={r['first_token_ms']:.0f}ms  SLA:{sla}")
         except Exception as e:
-            print(f"  ⚠️  Batch={bs} failed: {e}")
+            print(f"  [WARN] Batch={bs} failed: {e}")
     print()
 
     # ── 4. KV-cache analysis table ─────────────────────────────────────────
@@ -375,7 +375,7 @@ def main():
         json.dump(results, f, indent=2)
 
     print("=" * 70)
-    print(f"✅ All experiments complete. Results saved to baseline/results.json")
+    print(f"All experiments complete. Results saved to baseline/results.json")
     print("=" * 70)
 
 

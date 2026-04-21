@@ -254,7 +254,7 @@ class SLAValidator:
     def print_violations(self):
         """Print all violations"""
         if not self.violations:
-            print("✅ All SLA targets met!")
+            print("All SLA targets met!")
             return
         
         print(f"\n{'='*80}")
@@ -262,7 +262,7 @@ class SLAValidator:
         print(f"{'='*80}\n")
         
         for i, violation in enumerate(self.violations, 1):
-            severity_icon = "⚠️ " if violation.severity == 'warning' else "❌"
+            severity_icon = "[WARN] " if violation.severity == 'warning' else "[FAIL]"
             print(f"{severity_icon} {violation.severity.upper()} #{i}:")
             print(f"  Metric: {violation.metric_name}")
             print(f"  Measured: {violation.measured_value:.1f}")
@@ -332,7 +332,7 @@ if __name__ == "__main__":
     violations = validator.validate_all(metrics_good)
     print(f"Violations: {len(violations)}")
     if not violations:
-        print("✅ All SLA targets met!")
+        print("All SLA targets met!")
     
     print("\n")
     
@@ -358,4 +358,4 @@ if __name__ == "__main__":
     violations = validator.validate_all(metrics_bad)
     validator.print_violations()
     
-    print("✅ SLA validation test complete")
+    print("SLA validation test complete")

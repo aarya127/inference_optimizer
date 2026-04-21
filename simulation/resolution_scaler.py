@@ -304,7 +304,7 @@ if __name__ == "__main__":
     print(f"  {'N_crops':>7}  {'T_vision':>9}  {'T_lm':>9}  {'T_total':>9}  {'SLA?':>5}")
     print("  " + "-" * 55)
     for plan in scaler.sweep():
-        flag = "✅" if plan.sla_pass else "❌"
+        flag = "PASS" if plan.sla_pass else "FAIL"
         print(
             f"  {plan.n_crops:>7}  "
             f"{plan.t_vision_ms:>8.1f}  "
@@ -327,4 +327,4 @@ if __name__ == "__main__":
     print(f"  Reduction       : {plan.latency_reduction_pct:.1f}% vs baseline")
     print(f"  Notes           : {plan.notes}")
 
-    print("\n✅ Resolution scaler self-test complete")
+    print("\nResolution scaler self-test complete")
