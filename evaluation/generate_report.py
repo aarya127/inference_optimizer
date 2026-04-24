@@ -7,7 +7,7 @@ Produces
   figures/fig2_strategy_heatmaps.png   Controller strategy selection grid
   figures/fig3_pareto_curves.png       Quality × Latency Pareto frontier
   figures/fig4_nova_convergence.png    Nova SM reallocator burst timeline
-  PHASE8_REPORT.md                     6–8 page technical report
+  FINAL_REPORT.md                     6–8 page technical report
 
 Usage
 -----
@@ -697,7 +697,7 @@ def compute_ablation(seed: int = 0) -> List[Dict]:
 
 
 # =============================================================================
-# Technical Report (PHASE8_REPORT.md)
+# Technical Report (FINAL_REPORT.md)
 # =============================================================================
 
 def generate_report(
@@ -706,7 +706,7 @@ def generate_report(
     ablation:  List[Dict],
     fig_paths: Dict[str, str],
 ) -> str:
-    """Write PHASE8_REPORT.md and return its path."""
+    """Write FINAL_REPORT.md and return its path."""
 
     # Computed summary stats for report body
     baseline_ttft = stages[0]["total"]
@@ -1172,8 +1172,8 @@ def run_verification_checklist(calib: Dict) -> None:
          (_FIGURES / "fig3_pareto_curves.png").exists()),
         ("Figure 4 (convergence) written",
          (_FIGURES / "fig4_nova_convergence.png").exists()),
-        ("PHASE8_REPORT.md written",
-         (_ROOT / "PHASE8_REPORT.md").exists()),
+        ("FINAL_REPORT.md written",
+         (_ROOT / "FINAL_REPORT.md").exists()),
     ]
 
     all_pass = True
@@ -1232,7 +1232,7 @@ def main() -> None:
 
     # ── Technical report ──────────────────────────────────────────────────────
     print()
-    print("  Writing PHASE8_REPORT.md ...")
+    print("  Writing FINAL_REPORT.md ...")
     report_path = generate_report(stages, calib, ablation, fig_paths)
     report_size = Path(report_path).stat().st_size // 1024
     print(f"    → {report_path}  ({report_size} KB)")
