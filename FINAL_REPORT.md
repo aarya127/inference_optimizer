@@ -8,7 +8,7 @@
 ---
 ## Abstract
 
-We present **AMIO** (Adaptive Multimodal Inference Optimizer), a systems-level framework that reduces the time-to-first-token (TTFT) of SmolVLM-Instruct from a Phase 1 baseline of 8,536 ms to under 500 ms (a 24.4× speedup) while maintaining an average quality score of 0.83 across diverse request traffic. AMIO integrates five hardware-aware optimisation modules — adaptive crop scaling, W4A8 quantisation, PagedAttention KV management, an SJF continuous batching engine, and a Nova-inspired dynamic SM reallocator — into a unified AdaptiveController that solves a per-request constrained optimisation problem. We demonstrate that AMIO achieves a **51% SLA pass rate improvement** over a static baseline at the 500 ms budget and a **58 pp fragmentation reduction** via paged KV allocation.
+We present **AMIO** (Adaptive Multimodal Inference Optimizer), a systems-level framework that reduces the time-to-first-token (TTFT) of SmolVLM-Instruct from a 24-crop static baseline (8,536 ms) to an adaptive low-crop configuration constrained by a 500 ms SLA budget (349 ms, a 24.4× reduction), while maintaining an average quality score of 0.83 across diverse request traffic. The speedup is achieved by adaptively selecting minimal crop counts under load, not by accelerating the same fixed computation. AMIO integrates five hardware-aware optimisation modules — adaptive crop scaling, 4-bit weight quantisation with 8-bit activation modelling (W4A8-style), PagedAttention KV management, an SJF continuous batching engine, and a Nova-inspired stage scheduler — into a unified AdaptiveController that solves a per-request constrained optimisation problem. We demonstrate that AMIO achieves a **51% SLA pass rate improvement** over a static baseline at the 500 ms budget and a **58 pp fragmentation reduction** via paged KV allocation.
 
 ---
 ## 1. Introduction
@@ -19,7 +19,7 @@ Existing approaches either fix the resolution at inference time (sacrificing lat
 
 **Contributions:**
 1. A quadratic O(N²) prefill cost model calibrated on real M3 hardware (R² = 0.9978).
-2. A Nova-style dynamic SM allocator that recovers up to 30 SMs for vision under burst load.
+2. A Nova-inspired stage scheduler that models dynamic SM allocation by controlling stage-level compute priority, recovering up to 30 SM-equivalents of vision capacity under burst load.
 3. PagedAttention KV management reducing fragmentation from ~62.8% to ~5.3%.
 4. An OpenAI-compatible HTTP API with full per-request telemetry.
 5. A comparative evaluation against Static Baseline and Greedy Fast competitors.
@@ -35,7 +35,7 @@ Existing approaches either fix the resolution at inference time (sacrificing lat
 | Total GPU SMs | 38 |
 | Unified Memory | 8 GB |
 | Memory Bandwidth | 100 GB/s |
-| Model | SmolVLM-Instruct-500M W4A8 |
+| Model | SmolVLM-Instruct-500M (4-bit weights, W4A8-style modelling) |
 | Vision Encoder | SigLIP 27-layer |
 | KV quantisation | W4 (4-bit, 27,648 bytes/token) |
 
@@ -65,15 +65,15 @@ Existing approaches either fix the resolution at inference time (sacrificing lat
 
 ### 2.3  Nova Dynamic SM Partition
 
-The Nova SM reallocator (Phase 6.4) solves a single-step LP at each request admission, reducing decode SM allocation as the front-stage queue grows:
+The Nova stage scheduler (Phase 6.4) models SM allocation by adjusting stage-level compute priority at each request admission. Apple M3 does not expose direct SM partitioning (unlike CUDA MPS/MIG); the heuristic controls scheduling concurrency between the vision and decode workers, expressed analytically as:
 
 $$SM_{dec} = \max\bigl(SM_{min,dec},\; SM_{op} - \lfloor\alpha(N_{front}-1)\rfloor\bigr)$$
 
 $$SM_{vis} = 38 - SM_{dec}$$
 
-where $SM_{op} = 30$, $SM_{min,dec} = 4$, $\alpha = 2.0$.
+where $SM_{op} = 30$, $SM_{min,dec} = 4$, $\alpha = 2.0$, and the values represent modelled SM-equivalent compute shares rather than hardware-enforced partitions.
 
-When `n_decoding == 0` (idle decode worker), the vision encoder receives all 38 SMs with no cost.
+When `n_decoding == 0` (idle decode worker), the full compute budget (modelled as 38 SM-equivalents) is assigned to the vision encoder.
 
 ---
 ## 3. Cost Model Derivation
@@ -107,7 +107,7 @@ Auto-regressive decoding on M3 is memory-bandwidth-bound. Phase 5 calibration yi
 
 $$TBT(B) = 83.75 + 3.95 \times B \quad \text{(ms)}$$
 
-where $B$ is the concurrent decode batch size. SLA threshold: $TBT \le 80$ ms enforced at $B \le 1$ (single sequence, comfortably met).
+where $B$ is the concurrent decode batch size. The engine supports up to $B = 70$ concurrent decode sequences (KV memory ceiling). At $B = 1$ the model predicts TBT = 87.7 ms — already near the 80 ms human-perceptibility threshold — meaning per-token latency grows noticeably above that threshold as batch size increases. Continuous batching therefore trades aggregate throughput for per-request latency headroom at larger batch sizes.
 
 ### 3.4  Validation Report
 
@@ -130,11 +130,11 @@ Cost model predictions vs. measured M3 hardware times:
 
 ### 4.1  Phase 3: Adaptive Crop Scaling + DP Parallelism
 
-AMIO maps image resolution to the SigLIP crop grid {224→1, 336→4, 448→6, 512→9, 756→13, 1008→21, 1512→24}, halting the quadratic vision blowup at high resolution. Batch-level data parallelism (DP) processes independent images concurrently, enabling pipelined vision+decode.
+AMIO maps image resolution to the SigLIP crop grid {224→1, 336→4, 448→6, 512→9, 756→13, 1008→21, 1512→24}, halting the quadratic vision blowup at high resolution. Batch-level data parallelism (DP) is modelled by partitioning crops across SM groups concurrently, enabling pipelined vision+decode.
 
 ### 4.2  Phase 4: W4A8 Quantisation + Paged KV Cache
 
-4-bit weight quantisation reduces KV memory per token from 110,592 bytes (FP16) to 27,648 bytes (W4), a **4× reduction**. PagedAttention allocates KV blocks (16 tokens/block) on-demand, reducing fragmentation from the contiguous baseline of 62.8% to under 5.3%.
+4-bit weight quantisation (W4) reduces KV memory per token from 110,592 bytes (FP16) to 27,648 bytes, a **4× reduction**. Activation quantisation follows a W4A8-style analytical model; FP8 hardware instructions are not natively available on Apple Silicon, so 8-bit activation costs are modelled via the Phase 2 roofline rather than measured directly. PagedAttention allocates KV blocks (16 tokens/block) on-demand, reducing fragmentation from the contiguous baseline of 62.8% to under 5.3%.
 
 ### 4.3  Phase 5: Continuous Batching + SJF Scheduling
 
@@ -168,7 +168,7 @@ Total TTFT reduction: **8,536 ms → 349 ms  (24.4×  speedup,  96% reduction)**
 
 ![](fig2_strategy_heatmaps.png)
 
-The controller selects TP mode for low-resolution / low-load scenarios where the 25% prefill speedup compensates for TP overhead. At high resolution (756+ px) and idle queues, the controller opts for a single crop with no pruning, maximising accuracy within the SLA budget.
+The controller selects simulated TP mode for low-resolution / low-load scenarios where the modelled 25% prefill speedup (derived from SM-partition compute splitting with analytical allreduce costs) outweighs the communication overhead. At high resolution (756+ px) and idle queues, the controller opts for a single crop with no pruning, maximising accuracy within the SLA budget.
 
 ### 5.3  Comparative Analysis  *(Figure 3)*
 
@@ -188,7 +188,7 @@ AMIO achieves **+50.9 pp** SLA improvement vs. Static and **+0.72** quality impr
 
 ![](fig4_nova_convergence.png)
 
-During a 15-request burst (IAT=200 ms), the Nova heuristic drives `sm_vision` from the idle peak of 38 SMs down to 8–12 SMs as the decode queue saturates, then recovers to full 38 SMs once all requests complete. This confirms the U-curve behaviour observed in the Phase 6 heatmap: idle → high vision priority → mixed → decode-dominant → recovery.
+During a 15-request burst (IAT=200 ms), the Nova stage scheduler drives the modelled `sm_vision` share from the idle peak of 38 SM-equivalents down to 8–12 as the decode queue saturates, then recovers once all requests complete. This confirms the U-curve behaviour predicted by the scheduling model: idle → high vision priority → mixed → decode-dominant → recovery.
 
 ### 5.5  Memory Efficiency
 
@@ -219,14 +219,14 @@ Progressive TTFT improvement for a 512 px request (prompt_len=32) as each module
 ---
 ## 7. Final Verification Checklist
 
-- ✅ **Systems Modeling**: Phase 2 quadratic cost model (R²=0.9978, MAPE=2.55%)
-- ✅ **GPU Resource Reasoning**: Nova SM reallocator with mathematically-grounded allocation formula
-- ✅ **Memory Mastery**: PagedAttention eliminates fragmentation from 62.8% → 5.3% (4-bit KV)
-- ✅ **Runtime Orchestration**: OpenAI-compatible HTTP API with X-AMIO-* telemetry headers
-- ✅ **SLA Enforcement**: 500 ms TTFT budget met at 55.6% of scenarios (vs 4.7% static baseline)
-- ✅ **Accuracy Preservation**: AMIO quality score 0.83 vs Greedy 0.11 — 7.5× accuracy gain at comparable latency
-- ✅ **Prediction Accuracy**: Cost model MAE = 27.6 ms across calibration range
-- ✅ **Reproducibility**: All phases in simulation/ + model_calibration/ with deterministic seeds
+- **Systems Modeling**: Phase 2 quadratic cost model (R²=0.9978, MAPE=2.55%)
+- **GPU Resource Reasoning**: Nova SM reallocator with mathematically-grounded allocation formula
+- **Memory Mastery**: PagedAttention eliminates fragmentation from 62.8% → 5.3% (4-bit KV)
+- **Runtime Orchestration**: OpenAI-compatible HTTP API with X-AMIO-* telemetry headers
+- **SLA Enforcement**: 500 ms TTFT budget met at 55.6% of scenarios (vs 4.7% static baseline)
+- **Accuracy Preservation**: AMIO quality score 0.83 vs Greedy 0.11 — 7.5× accuracy gain at comparable latency
+- **Prediction Accuracy**: Cost model MAE = 27.6 ms across calibration range
+- **Reproducibility**: All phases in simulation/ + model_calibration/ with deterministic seeds
 
 ---
 ## 8. Conclusion

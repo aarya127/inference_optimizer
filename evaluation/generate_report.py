@@ -739,12 +739,16 @@ def generate_report(
     w(
         "We present **AMIO** (Adaptive Multimodal Inference Optimizer), a systems-level "
         "framework that reduces the time-to-first-token (TTFT) of SmolVLM-Instruct "
-        f"from a Phase 1 baseline of {baseline_ttft:,.0f} ms to under {SLA_TTFT_MS:.0f} ms "
-        f"(a {speedup:.1f}× speedup) while maintaining an average quality score of 0.83 "
+        f"from a 24-crop static baseline ({baseline_ttft:,.0f} ms) to an adaptive low-crop "
+        f"configuration constrained by a {SLA_TTFT_MS:.0f} ms SLA budget "
+        f"({amio_ttft:.0f} ms, a {speedup:.1f}× reduction), while maintaining an average quality score of 0.83 "
         "across diverse request traffic. "
+        "The speedup is achieved by adaptively selecting minimal crop counts under load, "
+        "not by accelerating the same fixed computation. "
         "AMIO integrates five hardware-aware optimisation modules — adaptive crop scaling, "
-        "W4A8 quantisation, PagedAttention KV management, an SJF continuous batching "
-        "engine, and a Nova-inspired dynamic SM reallocator — into a unified "
+        "4-bit weight quantisation with 8-bit activation modelling (W4A8-style), "
+        "PagedAttention KV management, an SJF continuous batching "
+        "engine, and a Nova-inspired stage scheduler — into a unified "
         "AdaptiveController that solves a per-request constrained optimisation problem. "
         "We demonstrate that AMIO achieves a **{:.0f}% SLA pass rate improvement** over "
         "a static baseline at the 500 ms budget and a **{:.0f} pp fragmentation reduction** "
@@ -776,7 +780,8 @@ def generate_report(
     w()
     w("**Contributions:**")
     w("1. A quadratic O(N²) prefill cost model calibrated on real M3 hardware (R² = {:.4f}).".format(calib["r2"]))
-    w("2. A Nova-style dynamic SM allocator that recovers up to {:.0f} SMs for vision under burst load.".format(M3_TOTAL_SMS - 8))
+    w("2. A Nova-inspired stage scheduler that models dynamic SM allocation by controlling stage-level compute priority, "
+       "recovering up to {:d} SM-equivalents of vision capacity under burst load.".format(M3_TOTAL_SMS - 8))
     w("3. PagedAttention KV management reducing fragmentation from ~62.8% to ~5.3%.")
     w("4. An OpenAI-compatible HTTP API with full per-request telemetry.")
     w("5. A comparative evaluation against Static Baseline and Greedy Fast competitors.")
@@ -825,19 +830,24 @@ def generate_report(
     w("### 2.3  Nova Dynamic SM Partition")
     w()
     w(
-        "The Nova SM reallocator (Phase 6.4) solves a single-step LP at each request "
-        "admission, reducing decode SM allocation as the front-stage queue grows:"
+        "The Nova stage scheduler (Phase 6.4) models SM allocation by adjusting stage-level "
+        "compute priority at each request admission. Apple M3 does not expose direct SM "
+        "partitioning (unlike CUDA MPS/MIG); the heuristic controls scheduling concurrency "
+        "between the vision and decode workers, expressed analytically as:"
     )
     w()
     w("$$SM_{dec} = \\max\\bigl(SM_{min,dec},\\; SM_{op} - \\lfloor\\alpha(N_{front}-1)\\rfloor\\bigr)$$")
     w()
     w(r"$$SM_{vis} = 38 - SM_{dec}$$")
     w()
-    w("where $SM_{op} = 30$, $SM_{min,dec} = 4$, $\\alpha = 2.0$.")
+    w(
+        "where $SM_{op} = 30$, $SM_{min,dec} = 4$, $\\alpha = 2.0$, and the values represent "
+        "modelled SM-equivalent compute shares rather than hardware-enforced partitions."
+    )
     w()
     w(
-        "When `n_decoding == 0` (idle decode worker), the vision encoder receives all "
-        "38 SMs with no cost."
+        "When `n_decoding == 0` (idle decode worker), the full compute budget "
+        "(modelled as 38 SM-equivalents) is assigned to the vision encoder."
     )
     w()
 
@@ -893,8 +903,11 @@ def generate_report(
     w()
     w(
         "where $B$ is the concurrent decode batch size. "
-        "SLA threshold: $TBT \\le 80$ ms enforced at $B \\le 1$ (single sequence, "
-        "comfortably met)."
+        "The engine supports up to $B = 70$ concurrent decode sequences (KV memory ceiling). "
+        "At $B = 1$ the model predicts TBT = 87.7 ms — already near the 80 ms "
+        "human-perceptibility threshold — meaning per-token latency grows noticeably "
+        "above that threshold as batch size increases. Continuous batching therefore "
+        "trades aggregate throughput for per-request latency headroom at larger batch sizes."
     )
     w()
     w("### 3.4  Validation Report")
@@ -926,15 +939,18 @@ def generate_report(
         "AMIO maps image resolution to the SigLIP crop grid "
         "{224→1, 336→4, 448→6, 512→9, 756→13, 1008→21, 1512→24}, "
         "halting the quadratic vision blowup at high resolution. "
-        "Batch-level data parallelism (DP) processes independent images concurrently, "
-        "enabling pipelined vision+decode."
+        "Batch-level data parallelism (DP) is modelled by partitioning crops across SM groups "
+        "concurrently, enabling pipelined vision+decode."
     )
     w()
     w("### 4.2  Phase 4: W4A8 Quantisation + Paged KV Cache")
     w()
     w(
-        "4-bit weight quantisation reduces KV memory per token from "
-        "110,592 bytes (FP16) to 27,648 bytes (W4), a **4× reduction**. "
+        "4-bit weight quantisation (W4) reduces KV memory per token from "
+        "110,592 bytes (FP16) to 27,648 bytes, a **4× reduction**. "
+        "Activation quantisation follows a W4A8-style analytical model; FP8 hardware "
+        "instructions are not natively available on Apple Silicon, so 8-bit activation "
+        "costs are modelled via the Phase 2 roofline rather than measured directly. "
         "PagedAttention allocates KV blocks (16 tokens/block) on-demand, "
         "reducing fragmentation from the contiguous baseline of 62.8% to under 5.3%."
     )
@@ -997,8 +1013,9 @@ def generate_report(
     w(f"![]({_abbr(fig_paths['fig2'])})")
     w()
     w(
-        "The controller selects TP mode for low-resolution / low-load scenarios "
-        "where the 25% prefill speedup compensates for TP overhead. "
+        "The controller selects simulated TP mode for low-resolution / low-load scenarios "
+        "where the modelled 25% prefill speedup (derived from SM-partition compute splitting "
+        "with analytical allreduce costs) outweighs the communication overhead. "
         "At high resolution (756+ px) and idle queues, the controller opts for "
         "a single crop with no pruning, maximising accuracy within the SLA budget."
     )
@@ -1025,10 +1042,10 @@ def generate_report(
     w(f"![]({_abbr(fig_paths['fig4'])})")
     w()
     w(
-        "During a 15-request burst (IAT=200 ms), the Nova heuristic drives `sm_vision` "
-        "from the idle peak of 38 SMs down to 8–12 SMs as the decode queue saturates, "
-        "then recovers to full 38 SMs once all requests complete. "
-        "This confirms the U-curve behaviour observed in the Phase 6 heatmap: "
+        "During a 15-request burst (IAT=200 ms), the Nova stage scheduler drives the "
+        "modelled `sm_vision` share from the idle peak of 38 SM-equivalents down to "
+        "8–12 as the decode queue saturates, then recovers once all requests complete. "
+        "This confirms the U-curve behaviour predicted by the scheduling model: "
         "idle → high vision priority → mixed → decode-dominant → recovery."
     )
     w()
@@ -1073,7 +1090,7 @@ def generate_report(
          "Phase 2 quadratic cost model (R²=0.9978, MAPE={:.2f}%)".format(calib["mape"]),
          True),
         ("GPU Resource Reasoning",
-         "Nova SM reallocator with mathematically-grounded allocation formula",
+         "Nova stage scheduler with mathematically-grounded SM-equivalent allocation model",
          True),
         ("Memory Mastery",
          f"PagedAttention eliminates fragmentation from 62.8% → 5.3% ({KV_QUANT_BITS}-bit KV)",
