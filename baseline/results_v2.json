@@ -1,0 +1,210 @@
+{
+  "meta": {
+    "model": "mlx-community/SmolVLM-Instruct-4bit",
+    "mlx_version": "0.31.0",
+    "platform": "macOS-14.6-arm64-arm-64bit",
+    "machine": "arm64",
+    "trials": 5,
+    "decode_tokens": 32,
+    "load_ms": 1735.9,
+    "method": "direct stage isolation with mx.eval on outputs; 1 warm-up pass per crop config; synthetic seeded image"
+  },
+  "configs": {
+    "crops_1": {
+      "total_input_tokens": 100,
+      "image_tokens": 81,
+      "n_crops": 1,
+      "vision": {
+        "mean_ms": 540.58,
+        "std_ms": 46.01,
+        "min_ms": 489.11,
+        "trials_ms": [
+          530.29,
+          489.11,
+          611.04,
+          517.4,
+          555.08
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 356.4,
+        "std_ms": 30.24,
+        "min_ms": 311.79,
+        "trials_ms": [
+          388.27,
+          357.32,
+          379.35,
+          311.79,
+          345.28
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 896.99,
+        "std_ms": 63.94,
+        "min_ms": 829.2,
+        "trials_ms": [
+          918.55,
+          846.43,
+          990.39,
+          829.2,
+          900.37
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 21.38,
+        "std_ms": 11.07,
+        "p95_ms": 29.62,
+        "n_tokens": 160
+      },
+      "peak_mem_mib": 2022.8,
+      "stream_generate_ttft_ms": 14306.0
+    },
+    "crops_5": {
+      "total_input_tokens": 466,
+      "image_tokens": 405,
+      "n_crops": 5,
+      "vision": {
+        "mean_ms": 2832.44,
+        "std_ms": 312.29,
+        "min_ms": 2298.69,
+        "trials_ms": [
+          2298.69,
+          2808.39,
+          3036.66,
+          2994.77,
+          3023.7
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 1110.8,
+        "std_ms": 43.0,
+        "min_ms": 1076.87,
+        "trials_ms": [
+          1093.26,
+          1076.87,
+          1105.96,
+          1092.42,
+          1185.47
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 3943.24,
+        "std_ms": 331.09,
+        "min_ms": 3391.94,
+        "trials_ms": [
+          3391.94,
+          3885.26,
+          4142.62,
+          4087.19,
+          4209.17
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 16.81,
+        "std_ms": 2.24,
+        "p95_ms": 20.57,
+        "n_tokens": 160
+      },
+      "peak_mem_mib": 2548.2,
+      "stream_generate_ttft_ms": 15017.2
+    },
+    "crops_10": {
+      "total_input_tokens": 922,
+      "image_tokens": 810,
+      "n_crops": 10,
+      "vision": {
+        "mean_ms": 5590.42,
+        "std_ms": 308.08,
+        "min_ms": 5142.45,
+        "trials_ms": [
+          5142.45,
+          5579.33,
+          5988.81,
+          5716.41,
+          5525.08
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 2314.12,
+        "std_ms": 79.26,
+        "min_ms": 2244.15,
+        "trials_ms": [
+          2264.2,
+          2335.07,
+          2442.35,
+          2284.85,
+          2244.15
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 7904.54,
+        "std_ms": 371.81,
+        "min_ms": 7406.66,
+        "trials_ms": [
+          7406.66,
+          7914.4,
+          8431.16,
+          8001.26,
+          7769.23
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 20.21,
+        "std_ms": 18.2,
+        "p95_ms": 29.03,
+        "n_tokens": 160
+      },
+      "peak_mem_mib": 2559.5,
+      "stream_generate_ttft_ms": 13539.1
+    },
+    "crops_17": {
+      "total_input_tokens": 1560,
+      "image_tokens": 1377,
+      "n_crops": 17,
+      "vision": {
+        "mean_ms": 9411.85,
+        "std_ms": 329.67,
+        "min_ms": 8843.17,
+        "trials_ms": [
+          8843.17,
+          9553.12,
+          9475.97,
+          9490.29,
+          9696.67
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 4983.26,
+        "std_ms": 971.39,
+        "min_ms": 3861.37,
+        "trials_ms": [
+          3861.37,
+          4879.54,
+          4962.92,
+          4676.6,
+          6535.85
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 14395.1,
+        "std_ms": 1253.95,
+        "min_ms": 12704.54,
+        "trials_ms": [
+          12704.54,
+          14432.67,
+          14438.9,
+          14166.89,
+          16232.52
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 24.69,
+        "std_ms": 39.84,
+        "p95_ms": 20.26,
+        "n_tokens": 160
+      },
+      "peak_mem_mib": 2573.6,
+      "stream_generate_ttft_ms": 20000.0
+    }
+  }
+}
