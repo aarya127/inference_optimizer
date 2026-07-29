@@ -1,4 +1,17 @@
 # AMIO Phase 0 - Service Level Agreement (SLA) Targets
+#
+# STALE — describes the earlier LLaVA-1.5-7B / M3-16GB design phase (see
+# "memory_targets_m3_16gb" and "phase0_success_criteria" below). Not read by
+# any current code path (scripts/verify_phase0.py only checks this file
+# exists; nothing parses its values). Retained for provenance.
+#
+# The actual study target is mlx-community/SmolVLM-Instruct-4bit on an M3
+# base with 8 GB unified memory. MEASURED findings (baseline/results_v2.json,
+# amio_constants.py) supersede the pre-checked "success criteria" below:
+# the 500ms TTFT target is INFEASIBLE on this hardware — measured vision
+# encoding alone is ~581 ms at the minimum (1-crop) setting, before any LM
+# prefill or decode. See simulation/controller.py's self-test output for the
+# honest current numbers.
 
 # Overview
 # --------
@@ -194,32 +207,35 @@ measurement:
     window_size: "Last 100 requests"
     required_samples: "Minimum 10 for valid p95/p99"
 
-# Success Criteria for Phase 0
+# Success Criteria for Phase 0 (STALE — LLaVA-1.5-7B design; pre-checked
+# unconditionally in the original file regardless of measured outcomes.
+# None of these were re-verified against the SmolVLM study actually run;
+# do not treat the checkmarks as current status.)
 phase0_success_criteria:
   functional:
-    - "✅ LLaVA-1.5-7B loads and runs on M3 16GB"
-    - "✅ INT4 quantization reduces memory to <6GB"
-    - "✅ Single-image inference produces valid outputs"
-    - "✅ Metrics collection infrastructure operational"
-    - "✅ TP simulation adds measurable overhead"
-    
+    - "LLaVA-1.5-7B loads and runs on M3 16GB (N/A — study target is SmolVLM on 8GB)"
+    - "INT4 quantization reduces memory to <6GB"
+    - "Single-image inference produces valid outputs"
+    - "Metrics collection infrastructure operational"
+    - "TP simulation adds measurable overhead"
+
   performance:
-    - "✅ TTFT p95 < 500ms for single request"
-    - "✅ TBT mean < 50ms (>20 tok/s)"
-    - "✅ Fragmentation < 20% sustained"
-    - "✅ Batch size 4 works within memory limits"
-    - "✅ No OOM errors during normal operation"
-    
+    - "MEASURED FALSE: TTFT p95 < 500ms for single request — measured vision alone is ~581ms at 1 crop"
+    - "TBT mean < 50ms (>20 tok/s) — MEASURED TRUE: ~18-25ms at batch=1"
+    - "Fragmentation < 20% sustained — depends on assumed allocator policy, not measured"
+    - "Batch size 4 works within memory limits"
+    - "No OOM errors during normal operation"
+
   accuracy:
-    - "✅ INT4 model accuracy >90% of FP16 baseline"
-    - "✅ TP simulation latency within ±15% of real 2xGPU"
-    - "✅ Metrics collection overhead < 1%"
-    
+    - "INT4 model accuracy >90% of FP16 baseline — NEVER MEASURED (no VQA benchmark run; see REVIEW_FINDINGS.md)"
+    - "TP simulation latency within ±15% of real 2xGPU — N/A, single-chip TP is not realizable (see simulation/tp_simulator.py)"
+    - "Metrics collection overhead < 1%"
+
   readiness:
-    - "✅ Cost models for Phase 1 controller defined"
-    - "✅ Baseline metrics collected and documented"
-    - "✅ Simulation methodology validated"
-    - "✅ Memory profiling complete"
+    - "Cost models for Phase 1 controller defined"
+    - "Baseline metrics collected and documented — see baseline/results_v2.json for the corrected campaign"
+    - "Simulation methodology validated"
+    - "Memory profiling complete"
 
 # Pareto-Optimal Trade-offs
 pareto_optimization:
