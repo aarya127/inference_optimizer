@@ -2,26 +2,16 @@
 """
 Extension 1 — vLLM / CUDA Baseline Comparison
 ===============================================
-Answers the core question:
-    "Is AMIO's algorithmic contribution hardware-independent?"
+Explores how the same crop-count endpoints would project to CUDA hardware.
 
 We cannot run vLLM on Apple M3 (no CUDA). Instead, we build an analytical
 model of A100 SXM4 40 GB performance using:
   1. Roofline scaling from measured M3 numbers (hardware ratio).
-  2. The same Phase 2 quadratic cost model, re-parameterised for A100.
-  3. Published vLLM benchmarks to sanity-check the projection.
+  2. The corrected measured M3 stage sums at 17 crops and 1 crop.
 
-Key insight
------------
-Split the total AMIO speedup into two orthogonal factors:
-    Speedup_total  =  Speedup_hardware  ×  Speedup_algorithm
-
-On M3:    8,536 ms  →  349 ms    ≡  Speedup_algorithm = 24.4 ×  (hardware fixed)
-On A100:    ~98 ms  →  ~4.7 ms   ≡  Speedup_algorithm ≈ 20.9 ×  (hardware fixed)
-
-The algorithm speedup is roughly the same on both platforms, confirming that
-AMIO's contributions (adaptive cropping, W4 quantisation, Nova scheduling) are
-hardware-independent.
+This is a modeled projection, not an A100/vLLM measurement. Because both M3
+endpoints are divided by the same assumed hardware ratio, preserving their
+speedup on A100 is algebraic and cannot establish hardware independence.
 
 Output
 ------
@@ -32,7 +22,6 @@ Output
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -45,6 +34,9 @@ import numpy as np
 # ── project root ──────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
+
+import amio_constants as C
+from simulation.kv_manager import ContiguousBackend, PagedBackend
 
 # ── Output paths ──────────────────────────────────────────────────────────────
 FIG_PATH    = _ROOT / "figures" / "fig5_vllm_comparison.png"
@@ -68,35 +60,16 @@ COMPUTE_RATIO   = A100_COMPUTE_TFLOPS / M3_COMPUTE_TFLOPS    # 86.7×
 BANDWIDTH_RATIO = A100_BANDWIDTH_GBps / M3_BANDWIDTH_GBps     # 15.55×
 
 # =============================================================================
-# SmolVLM-Instruct-500M cost model (from Phase 2 calibration)
+# Corrected SmolVLM cost model inputs
 # =============================================================================
 
-# Vision encoder (SigLIP)  — compute-bound (FLOPs scale with hardware)
-VISION_BASE_MS_M3       = 5_991.0   # 24 crops, full grid, M3
-CROPS_BASELINE          = 24
-CROPS_AMIO              = 1         # adaptive selection at 500 ms SLA
-
-# LM prefill — compute-bound at the token counts used here
-LM_PREFILL_1548_M3_MS   = 2_498.0   # 1 548 visual tokens, M3  (Phase 1 measured)
-
-# Phase 2 cost model coefficients (R² = 0.9978)
-GAMMA  = 2.095744e-05   # ms/token²  (quadratic, <2% contribution at N=1548)
-BETA   = 1.590525       # ms/token   (dominant linear term)
-ALPHA  = -20.08         # ms         (constant)
-
-# Decode — bandwidth-bound (scales with memory bandwidth)
-TBT_B1_M3_MS            = 87.7      # ms/token at B=1, M3, W4 KV
-
-# KV memory
-KV_FP16_BYTES_PER_TOKEN = 110_592   # 2 × 24 layers × 1152 hidden × 2 B (FP16)
-KV_W4_BYTES_PER_TOKEN   = 27_648    # 4-bit compressed (4× smaller)
-MODEL_WEIGHTS_GB_FP16   = 1.0       # 500M × 2 B ≈ 1 GB
-MODEL_WEIGHTS_GB_W4     = 0.25      # 500M × 0.5 B ≈ 0.25 GB
-
-
-def lm_prefill_ms_m3(n_tokens: int) -> float:
-    """Phase 2 cost model for LM prefill on M3 (ms)."""
-    return GAMMA * n_tokens**2 + BETA * n_tokens + ALPHA
+CROPS_BASELINE          = C.MAX_CROPS
+CROPS_AMIO              = 1
+TOKENS_BASELINE         = C.TOKENS_PER_CONFIG[CROPS_BASELINE]
+TOKENS_AMIO             = C.TOKENS_PER_CONFIG[CROPS_AMIO]
+KV_FP16_BYTES_PER_TOKEN = C.KV_BYTES_PER_TOKEN_FP16
+KV_W4_BYTES_PER_TOKEN   = C.KV_BYTES_PER_TOKEN_W4
+MODEL_WEIGHTS_GB_W4     = C.MODEL_WEIGHTS_MB / 1000.0
 
 
 # =============================================================================
@@ -115,7 +88,7 @@ def project_bandwidth(m3_ms: float) -> float:
 
 def max_concurrent_seqs(memory_gb: float, weights_gb: float,
                          kv_bytes_per_token: int,
-                         avg_seq_len: int = 1_548) -> int:
+                         avg_seq_len: int = TOKENS_BASELINE) -> int:
     """
     Maximum concurrent sequences fitting in memory.
 
@@ -142,67 +115,63 @@ def throughput_tok_per_s(b: int, tbt: float) -> float:
 def build_comparison() -> dict:
     """
     Returns a dict of {system_label: {metric: value}} for 4 systems:
-      1. M3 MLX Naive   — 24 crops, FP16 KV, no AMIO optimisations
-      2. M3 MLX AMIO    — 1 crop, W4 KV, all AMIO optimisations (measured)
-      3. A100 vLLM Naive — 24 crops, FP16 KV, no adaptive algorithms
-      4. A100 + AMIO    — same algorithms applied on A100 hardware
-    """
-    # ── Visual token counts ──────────────────────────────────────────────────
-    n_tokens_full   = 1_548   # 24 crops
-    n_tokens_amio   = 96      # 1 crop (64 visual) + 32 prompt tokens
+      1. M3 MLX max-crop — measured 17-crop stage sum, modeled contiguous KV
+      2. M3 MLX min-crop — measured 1-crop stage sum, modeled paged W4 KV
+      3. A100 max-crop projection — M3 endpoint scaled by peak FLOPS ratio
+      4. A100 min-crop projection — same scaling assumption
 
-    # ── 1. M3 MLX Naive (Phase 1 measured) ───────────────────────────────────
-    m3_naive_vision_ms  = VISION_BASE_MS_M3
-    m3_naive_prefill_ms = LM_PREFILL_1548_M3_MS
-    m3_naive_ttft_ms    = m3_naive_vision_ms + m3_naive_prefill_ms   # 8 489 ms
-    m3_naive_tbt_ms     = TBT_B1_M3_MS
-    m3_naive_kv_frag    = 62.8   # measured (Phase 4 baseline)
+    The two M3 TTFT values are measurements. Fragmentation/capacity and every
+    A100 value are analytical policy projections.
+    """
+    # ── 1. M3 maximum-crop measured endpoint ─────────────────────────────────
+    m3_naive_ttft_ms    = C.TTFT_MS_MEASURED_17_CROP
+    m3_naive_tbt_ms     = (
+        C.DECODE_OVERHEAD_MS_MEASURED
+        + C.DECODE_KV_MS_PER_CTX_TOKEN * TOKENS_BASELINE
+    )
+    m3_naive_kv_frag    = ContiguousBackend().allocate(
+        TOKENS_BASELINE
+    ).fragmentation_pct
     m3_naive_max_seqs   = max_concurrent_seqs(
-        M3_MEMORY_GB, MODEL_WEIGHTS_GB_FP16, KV_FP16_BYTES_PER_TOKEN)
+        M3_MEMORY_GB, MODEL_WEIGHTS_GB_W4, KV_FP16_BYTES_PER_TOKEN)
     m3_naive_thru       = throughput_tok_per_s(1, m3_naive_tbt_ms)
 
-    # ── 2. M3 MLX AMIO (Phase 8 measured) ────────────────────────────────────
-    m3_amio_ttft_ms     = 349.0   # Phase 8 report
-    m3_amio_tbt_ms      = TBT_B1_M3_MS   # decode path unchanged by crop selection
-    m3_amio_kv_frag     = 5.3    # Phase 8 report
+    # ── 2. M3 minimum-crop measured endpoint ─────────────────────────────────
+    # This is the measured 1-crop stage sum, not a measurement of the service.
+    m3_amio_ttft_ms     = C.TTFT_MS_MEASURED_1_CROP
+    m3_amio_tbt_ms      = (
+        C.DECODE_OVERHEAD_MS_MEASURED
+        + C.DECODE_KV_MS_PER_CTX_TOKEN * TOKENS_AMIO
+    )
+    m3_amio_kv_frag     = PagedBackend().allocate(
+        TOKENS_AMIO
+    ).fragmentation_pct
     m3_amio_max_seqs    = max_concurrent_seqs(
         M3_MEMORY_GB, MODEL_WEIGHTS_GB_W4, KV_W4_BYTES_PER_TOKEN)
     m3_amio_thru        = throughput_tok_per_s(1, m3_amio_tbt_ms)
 
-    # ── 3. A100 vLLM Naive (analytical) ──────────────────────────────────────
-    # vLLM does NOT do adaptive cropping; uses full 24-crop grid.
-    # vLLM already has PagedAttention → frag ≈ 2%.
-    # vLLM already has continuous batching.
-    # Latency: scale M3 compute-bound measurements by COMPUTE_RATIO.
-    a100_naive_vision_ms  = project_compute(m3_naive_vision_ms)    # 69.1 ms
-    a100_naive_prefill_ms = project_compute(m3_naive_prefill_ms)   # 28.8 ms
-    a100_naive_ttft_ms    = a100_naive_vision_ms + a100_naive_prefill_ms  # 97.9 ms
-    # Decode: bandwidth-bound
-    a100_naive_tbt_ms     = project_bandwidth(TBT_B1_M3_MS)        # 5.6 ms
-    a100_naive_kv_frag    = 2.0    # vLLM PagedAttention is very efficient
+    # ── 3. A100/vLLM maximum-crop modeled projection ─────────────────────────
+    a100_naive_ttft_ms    = project_compute(m3_naive_ttft_ms)
+    a100_naive_tbt_ms     = project_bandwidth(m3_naive_tbt_ms)
+    a100_naive_kv_frag    = PagedBackend().allocate(
+        TOKENS_BASELINE
+    ).fragmentation_pct
     a100_naive_max_seqs   = max_concurrent_seqs(
-        A100_MEMORY_GB, MODEL_WEIGHTS_GB_FP16, KV_FP16_BYTES_PER_TOKEN)
+        A100_MEMORY_GB, MODEL_WEIGHTS_GB_W4, KV_FP16_BYTES_PER_TOKEN)
     a100_naive_thru       = throughput_tok_per_s(1, a100_naive_tbt_ms)
 
-    # ── 4. A100 + AMIO algorithms (analytical) ────────────────────────────────
-    # Same algorithmic gains as M3 AMIO, applied to A100 baseline.
-    # Vision (1 crop): M3 = 5991/24 = 249.6 ms → A100 = 249.6 / COMPUTE_RATIO
-    a100_amio_vision_ms  = project_compute(VISION_BASE_MS_M3 / CROPS_BASELINE)  # 2.9 ms
-    # LM prefill (96 tokens): use Phase 2 model scaled to A100
-    m3_amio_prefill_ms   = max(0.0, lm_prefill_ms_m3(n_tokens_amio))  # ~132 ms on M3
-    a100_amio_prefill_ms = project_compute(m3_amio_prefill_ms)          # ~1.5 ms
-    a100_amio_ttft_ms    = a100_amio_vision_ms + a100_amio_prefill_ms   # ~4.4 ms
-    # Decode: bandwidth-bound, same TBT as A100 naive (W4 reduces KV size,
-    # but TBT is dominated by weight loading which is fixed per step)
-    a100_amio_tbt_ms     = project_bandwidth(TBT_B1_M3_MS)              # 5.6 ms
-    a100_amio_kv_frag    = 2.0   # vLLM PagedAttention still handles paging
+    # ── 4. A100/vLLM minimum-crop modeled projection ─────────────────────────
+    a100_amio_ttft_ms    = project_compute(m3_amio_ttft_ms)
+    a100_amio_tbt_ms     = project_bandwidth(m3_amio_tbt_ms)
+    a100_amio_kv_frag    = PagedBackend().allocate(TOKENS_AMIO).fragmentation_pct
     a100_amio_max_seqs   = max_concurrent_seqs(
         A100_MEMORY_GB, MODEL_WEIGHTS_GB_W4, KV_W4_BYTES_PER_TOKEN)
     a100_amio_thru       = throughput_tok_per_s(1, a100_amio_tbt_ms)
 
-    # ── Algorithm speedup (hardware-independent) ──────────────────────────────
-    m3_algo_speedup   = m3_naive_ttft_ms  / m3_amio_ttft_ms      # 24.4×
-    a100_algo_speedup = a100_naive_ttft_ms / a100_amio_ttft_ms   # ~22×
+    # ── Crop-endpoint ratio (A100 equality is by construction) ────────────────
+    m3_algo_speedup   = m3_naive_ttft_ms / m3_amio_ttft_ms
+    # Equal by construction: both endpoints use the same compute scaling.
+    a100_algo_speedup = a100_naive_ttft_ms / a100_amio_ttft_ms
 
     results = {
         "M3 MLX\nNaive": {
@@ -212,7 +181,8 @@ def build_comparison() -> dict:
             "max_seqs":      m3_naive_max_seqs,
             "throughput":    m3_naive_thru,
             "algo_speedup":  1.0,
-            "hw":            "M3 Mac",
+            "hw":            "M3 measured",
+            "provenance":    "MEASURED TTFT; MODELED memory policy",
             "color":         "#d62728",
         },
         "M3 MLX\nAMIO": {
@@ -222,7 +192,8 @@ def build_comparison() -> dict:
             "max_seqs":      m3_amio_max_seqs,
             "throughput":    m3_amio_thru,
             "algo_speedup":  m3_algo_speedup,
-            "hw":            "M3 Mac",
+            "hw":            "M3 measured",
+            "provenance":    "MEASURED TTFT; MODELED memory policy",
             "color":         "#2ca02c",
         },
         "A100 vLLM\nNaive": {
@@ -232,7 +203,8 @@ def build_comparison() -> dict:
             "max_seqs":      a100_naive_max_seqs,
             "throughput":    a100_naive_thru,
             "algo_speedup":  1.0,
-            "hw":            "A100 SXM4",
+            "hw":            "A100 SXM4 projection",
+            "provenance":    "MODELED projection",
             "color":         "#ff7f0e",
         },
         "A100 vLLM\n+AMIO": {
@@ -242,7 +214,8 @@ def build_comparison() -> dict:
             "max_seqs":      a100_amio_max_seqs,
             "throughput":    a100_amio_thru,
             "algo_speedup":  a100_algo_speedup,
-            "hw":            "A100 SXM4",
+            "hw":            "A100 SXM4 projection",
+            "provenance":    "MODELED projection",
             "color":         "#1f77b4",
         },
     }
@@ -264,7 +237,7 @@ def make_figure(results: dict) -> None:
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(
-        "Extension 1 — AMIO vs vLLM: Algorithmic Contribution is Hardware-Independent",
+        "Extension 1 — M3 Measurements and A100/vLLM Modeled Projection",
         fontsize=13, fontweight="bold", y=1.01,
     )
 
@@ -293,7 +266,7 @@ def make_figure(results: dict) -> None:
 
     # ── Panel 2: Algorithm speedup (hardware-normalized) ─────────────────────
     ax = axes[1]
-    pair_labels = ["M3 Mac\n(measured)", "A100 SXM4\n(analytical)"]
+    pair_labels = ["M3 endpoints\n(measured)", "A100 endpoints\n(modeled)"]
     pair_speedups = [
         results["M3 MLX\nAMIO"]["algo_speedup"],
         results["A100 vLLM\n+AMIO"]["algo_speedup"],
@@ -308,13 +281,13 @@ def make_figure(results: dict) -> None:
                 ha="center", va="bottom", fontsize=11, fontweight="bold")
     ax.axhline(1, color="black", linewidth=0.8, linestyle="--", alpha=0.4)
     ax.set_ylabel("Algorithm speedup  (vs same-hardware naive)", fontsize=10)
-    ax.set_title("Algorithmic Gain\n(hardware-independent)", fontsize=11, fontweight="bold")
+    ax.set_title("Crop-endpoint ratio\n(preserved by construction)", fontsize=11, fontweight="bold")
     ax.set_ylim(0, max(pair_speedups) * 1.25)
     ax.tick_params(axis="x", labelsize=9)
     ax.grid(axis="y", alpha=0.3)
-    # Annotate similarity
+    # The equality is algebraic because both endpoints use the same scaling.
     diff_pct = abs(pair_speedups[0] - pair_speedups[1]) / pair_speedups[0] * 100
-    ax.text(0.5, 0.06, f"Difference: {diff_pct:.1f}% — algorithm gain is portable",
+    ax.text(0.5, 0.06, f"Difference: {diff_pct:.1f}% — equal by model construction",
             transform=ax.transAxes, ha="center", fontsize=8,
             color="#444", style="italic",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="#fffbe6", edgecolor="#ccc"))
@@ -368,101 +341,96 @@ def print_table(results: dict) -> None:
     m3_algo  = results["M3 MLX\nAMIO"]["algo_speedup"]
     a100_algo = results["A100 vLLM\n+AMIO"]["algo_speedup"]
     diff_pct = abs(m3_algo - a100_algo) / m3_algo * 100
-    print(f"\nAlgorithm speedup:  M3={m3_algo:.1f}×   A100={a100_algo:.1f}×   "
-          f"(differ by {diff_pct:.1f}% — hardware-independent ✓)\n")
+    print(f"\nCrop-endpoint ratio: M3={m3_algo:.1f}×   A100={a100_algo:.1f}×")
+    print("A100 equality is by construction (same scaling factor), not validation "
+          f"of hardware portability; difference={diff_pct:.1f}%.\n")
 
 
 # =============================================================================
 # Report section
 # =============================================================================
 
-REPORT_SECTION = """
----
-## Extension 1 — PyTorch + vLLM Baseline Comparison
+def build_report_section(results: dict) -> str:
+    """Build report markdown from build_comparison(); no duplicated literals."""
+    labels = list(results)
+    rows = [results[label] for label in labels]
+    m3_ratio = rows[0]["ttft_ms"] / rows[1]["ttft_ms"]
+    a100_ratio = rows[2]["ttft_ms"] / rows[3]["ttft_ms"]
 
-> **Question:** Is AMIO's algorithmic contribution hardware-independent?
-
-### Methodology
-
-We cannot run vLLM on Apple M3 (no CUDA driver). Instead, we build an
-**analytical projection** of A100 SXM4 40 GB performance using:
-
-1. **Roofline scaling** — scale M3 measured times by hardware ratios:
-   - Compute-bound (vision, prefill): `t_A100 = t_M3 / 86.7` (312 ÷ 3.6 TFLOPS)
-   - Bandwidth-bound (decode TBT): `t_A100 = t_M3 / 15.6` (1555 ÷ 100 GB/s)
-2. **Phase 2 cost model** — re-applied at A100 token counts.
-3. **Published vLLM throughput figures** used as a sanity check (≈ 5–6 ms TBT
-   for sub-1B models on A100, consistent with our 5.6 ms projection).
-
-Four systems are compared:
-
-| System | Hardware | Notes |
-|--------|----------|-------|
-| M3 MLX Naive | Apple M3 | Phase 1 measured, 24 crops, FP16 KV |
-| M3 MLX AMIO  | Apple M3 | Phase 8 measured, adaptive crops, W4 KV |
-| A100 vLLM Naive | A100 SXM4 | Analytical, 24 crops, FP16 KV |
-| A100 vLLM + AMIO | A100 SXM4 | Analytical, AMIO algorithms applied |
-
-### Results
-
-| Metric | M3 Naive | M3 AMIO | A100 vLLM | A100 + AMIO |
-|--------|----------|---------|-----------|-------------|
-| TTFT (p50, ms) | 8,536 | **349** | 98 | **4.4** |
-| Algorithm speedup | 1× | **24.4×** | 1× | **22.3×** |
-| TBT B=1 (ms) | 87.7 | 87.7 | 5.6 | 5.6 |
-| KV Frag% | 62.8% | 5.3% | ~2%* | ~2%* |
-| Max concurrent seqs | ≤2 | **8** | 222 | **888** |
-
-*vLLM already implements PagedAttention.
-
-### Key Findings
-
-**F1 — Algorithm speedup is hardware-portable.**  
-AMIO delivers 24.4× on M3 and an analytically projected 22.3× on A100 — a
-difference of only 8.6%. The dominant gain (adaptive crop reduction from 24 to
-1 crop) is a pure algorithmic lever independent of hardware.
-
-**F2 — Hardware and algorithm gains are orthogonal.**  
-The hardware gap (A100 vs M3, ~87× compute) compounds with, but does not
-depend on, the algorithmic gap. An AMIO-augmented A100 reaches ~4.4 ms TTFT,
-while a naive A100 sits at ~98 ms — confirming that serving infrastructure
-alone does not solve the vision-bottleneck problem.
-
-**F3 — W4 quantisation gives 4× KV headroom on any platform.**  
-By shrinking KV bytes-per-token from 110,592 (FP16) to 27,648 (W4), AMIO
-quadruples the number of concurrent sequences a fixed memory budget can
-support — from 2→8 on M3 and 222→888 on A100.
-
-**F4 — vLLM already provides PagedAttention and continuous batching.**  
-These are not differentiating AMIO contributions on CUDA. AMIO's unique
-additions over stock vLLM are: (a) adaptive crop scaling, (b) W4-aware KV
-budgeting, and (c) a Nova-style stage scheduler. All three are
-hardware-independent algorithms that vLLM could incorporate.
-
-### Figure
-
-![](figures/fig5_vllm_comparison.png)
-
-*Left: TTFT on log scale — hardware gap dwarfs algorithm gap in absolute terms,
-but algorithm gains apply equally on both platforms. Centre: Algorithm speedup
-normalised per hardware — both platforms show ~22–24× gain. Right: Max
-concurrent sequences — W4 gives 4× capacity on any hardware.*
-
-*Analysis generated by `evaluation/vllm_baseline.py`.*
-"""
+    lines = [
+        "",
+        "---",
+        "## Extension 1 — PyTorch + vLLM Modeled Projection",
+        "",
+        "> **Provenance:** the two M3 TTFT endpoints are MEASURED stage sums. "
+        "All A100/vLLM numbers, memory capacities, and fragmentation values are "
+        "MODELED projections; no A100 or vLLM benchmark was run.",
+        "",
+        "### Methodology",
+        "",
+        "The projection divides compute-bound M3 TTFT by the peak-FLOPS ratio "
+        f"({COMPUTE_RATIO:.1f}x) and batch-1 TBT by the bandwidth ratio "
+        f"({BANDWIDTH_RATIO:.2f}x). This is a deliberately simple roofline "
+        "projection, not a prediction calibrated on CUDA kernels. The two crop "
+        "endpoints use the same scaling factor, so their A100 ratio is preserved "
+        "algebraically and cannot validate hardware independence.",
+        "",
+        "### Results",
+        "",
+        "| Metric | M3 max crop | M3 min crop | A100 max crop | A100 min crop |",
+        "|--------|-------------|-------------|---------------|---------------|",
+        "| Provenance | MEASURED TTFT | MEASURED TTFT | MODELED projection | MODELED projection |",
+        "| Crops | {} | {} | {} | {} |".format(
+            CROPS_BASELINE, CROPS_AMIO, CROPS_BASELINE, CROPS_AMIO
+        ),
+        "| TTFT stage sum (ms) | {:,.1f} | {:,.1f} | {:,.1f} | {:,.1f} |".format(
+            *(r["ttft_ms"] for r in rows)
+        ),
+        "| Crop-endpoint ratio | 1x | {:.1f}x | 1x | {:.1f}x |".format(
+            m3_ratio, a100_ratio
+        ),
+        "| TBT B=1 (ms) | {:.1f} | {:.1f} | {:.1f} | {:.1f} |".format(
+            *(r["tbt_ms"] for r in rows)
+        ),
+        "| Allocator-policy waste | {:.1f}% | {:.1f}% | {:.1f}% | {:.1f}% |".format(
+            *(r["kv_frag_pct"] for r in rows)
+        ),
+        "| Modeled max sequences | {:,} | {:,} | {:,} | {:,} |".format(
+            *(r["max_seqs"] for r in rows)
+        ),
+        "",
+        "The M3 range is a crop/fidelity tradeoff, not a same-work acceleration: "
+        "the 1-crop configuration processes far less visual input. The 500 ms SLA "
+        "remains infeasible on M3 because the measured 1-crop stage sum is "
+        f"{rows[1]['ttft_ms']:.0f} ms.",
+        "",
+        f"KV sizes are {KV_FP16_BYTES_PER_TOKEN:,} B/token (FP16) and "
+        f"{KV_W4_BYTES_PER_TOKEN:,} B/token (modeled W4). Fragmentation is generated "
+        "by the repository's assumed contiguous/paged policies, not measured from "
+        "MLX or vLLM.",
+        "",
+        "### Figure",
+        "",
+        "![](figures/fig5_vllm_comparison.png)",
+        "",
+        "*Analysis generated by `evaluation/vllm_baseline.py`.*",
+        "",
+    ]
+    return "\n".join(lines)
 
 
-def append_to_report() -> None:
+def append_to_report(results: dict) -> None:
+    report_section = build_report_section(results)
     text = REPORT_PATH.read_text()
     if "Extension 1" in text:
         # Replace existing section
         start = text.find("\n---\n## Extension 1")
         if start != -1:
-            text = text[:start] + REPORT_SECTION
+            text = text[:start] + report_section
             REPORT_PATH.write_text(text)
             print(f"[UPDATED] {REPORT_PATH}  (replaced existing Extension 1 section)")
             return
-    REPORT_PATH.write_text(text.rstrip() + "\n" + REPORT_SECTION)
+    REPORT_PATH.write_text(text.rstrip() + "\n" + report_section)
     print(f"[APPENDED] {REPORT_PATH}")
 
 
@@ -471,19 +439,10 @@ def append_to_report() -> None:
 # =============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AMIO vs vLLM analytical comparison")
-    parser.add_argument("--write-report", action="store_true",
-                        help="Append Extension 1 section to FINAL_REPORT.md")
-    args = parser.parse_args()
-
     results = build_comparison()
     print_table(results)
     make_figure(results)
-
-    if args.write_report:
-        append_to_report()
-    else:
-        print("[INFO]  Pass --write-report to append the section to FINAL_REPORT.md")
+    append_to_report(results)
 
 
 if __name__ == "__main__":
