@@ -1,0 +1,170 @@
+{
+  "meta": {
+    "model": "mlx-community/SmolVLM-Instruct-4bit",
+    "mlx_version": "0.31.0",
+    "platform": "macOS-14.6-arm64-arm-64bit",
+    "machine": "arm64",
+    "trials": 2,
+    "decode_tokens": 8,
+    "load_ms": 1567.2,
+    "method": "direct stage isolation with mx.eval on outputs; 1 warm-up pass per crop config; synthetic seeded image"
+  },
+  "configs": {
+    "crops_1": {
+      "total_input_tokens": 100,
+      "image_tokens": 81,
+      "n_crops": 1,
+      "vision": {
+        "mean_ms": 376.3,
+        "std_ms": 20.32,
+        "min_ms": 361.93,
+        "trials_ms": [
+          361.93,
+          390.66
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 222.12,
+        "std_ms": 17.08,
+        "min_ms": 210.05,
+        "trials_ms": [
+          210.05,
+          234.2
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 598.42,
+        "std_ms": 37.4,
+        "min_ms": 571.98,
+        "trials_ms": [
+          571.98,
+          624.87
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 18.79,
+        "std_ms": 10.84,
+        "p95_ms": 33.13,
+        "n_tokens": 16
+      },
+      "peak_mem_mib": 2022.8
+    },
+    "crops_5": {
+      "total_input_tokens": 466,
+      "image_tokens": 405,
+      "n_crops": 5,
+      "vision": {
+        "mean_ms": 1790.99,
+        "std_ms": 57.6,
+        "min_ms": 1750.26,
+        "trials_ms": [
+          1750.26,
+          1831.73
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 810.53,
+        "std_ms": 12.12,
+        "min_ms": 801.96,
+        "trials_ms": [
+          801.96,
+          819.11
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 2601.53,
+        "std_ms": 69.73,
+        "min_ms": 2552.22,
+        "trials_ms": [
+          2552.22,
+          2650.83
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 18.03,
+        "std_ms": 2.81,
+        "p95_ms": 22.47,
+        "n_tokens": 16
+      },
+      "peak_mem_mib": 2151.7
+    },
+    "crops_10": {
+      "total_input_tokens": 922,
+      "image_tokens": 810,
+      "n_crops": 10,
+      "vision": {
+        "mean_ms": 3921.29,
+        "std_ms": 219.86,
+        "min_ms": 3765.83,
+        "trials_ms": [
+          3765.83,
+          4076.76
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 1742.17,
+        "std_ms": 69.25,
+        "min_ms": 1693.21,
+        "trials_ms": [
+          1693.21,
+          1791.14
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 5663.47,
+        "std_ms": 289.11,
+        "min_ms": 5459.04,
+        "trials_ms": [
+          5459.04,
+          5867.9
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 22.73,
+        "std_ms": 16.05,
+        "p95_ms": 53.0,
+        "n_tokens": 16
+      },
+      "peak_mem_mib": 2355.1
+    },
+    "crops_17": {
+      "total_input_tokens": 1560,
+      "image_tokens": 1377,
+      "n_crops": 17,
+      "vision": {
+        "mean_ms": 9248.01,
+        "std_ms": 1243.56,
+        "min_ms": 8368.68,
+        "trials_ms": [
+          8368.68,
+          10127.34
+        ]
+      },
+      "lm_prefill": {
+        "mean_ms": 7011.91,
+        "std_ms": 4249.73,
+        "min_ms": 4006.89,
+        "trials_ms": [
+          4006.89,
+          10016.92
+        ]
+      },
+      "ttft_stage_sum": {
+        "mean_ms": 16259.92,
+        "std_ms": 5493.29,
+        "min_ms": 12375.57,
+        "trials_ms": [
+          12375.57,
+          20144.27
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 47.76,
+        "std_ms": 81.15,
+        "p95_ms": 244.95,
+        "n_tokens": 16
+      },
+      "peak_mem_mib": 2545.4
+    }
+  }
+}
