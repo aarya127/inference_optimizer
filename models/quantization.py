@@ -1,14 +1,24 @@
 """
 4-Bit Quantization Framework for MLX
 
-Implements group quantization for reducing 7B multimodal models 
-from ~14GB (FP16) to ~4GB (INT4) on Apple Silicon M3.
+NOTE: this module is not imported by the live service — it is standalone
+scaffolding targeting 7B LLaVA-class models, not the SmolVLM checkpoint the
+study actually uses (which ships pre-quantized).
+
+Implements group quantization math (quantize/dequantize round trip) and a
+size ESTIMATOR.  Honesty notes:
+- `estimate_quantization_savings` (formerly `quantize_model`) does NOT
+  modify any weights — it only computes projected sizes.
+- Quantized values are stored as uint8 (1 byte/weight), not packed int4
+  (0.5 byte/weight); in-memory footprint is therefore 2x the packed-int4
+  figure used in the size estimates.
+- `quantize_llava_model` is unimplemented and raises NotImplementedError
+  (a previous version returned fabricated quality metrics).
 
 Supports:
 - Group quantization (group_size=64)
 - Selective layer quantization
-- Calibration using minmax method
-- Quality validation
+- Quality validation (compares two supplied models on test inputs)
 """
 
 import mlx.core as mx
@@ -63,17 +73,20 @@ class GroupQuantizer:
         self.scale_dtype = mx.float16
         
     def quantize_weights(
-        self, 
+        self,
         weights: mx.array
-    ) -> Tuple[mx.array, mx.array, mx.array]:
+    ) -> Tuple[mx.array, dict]:
         """
         Quantize weights using group quantization
-        
+
         Args:
             weights: Weight tensor of shape [out_features, in_features]
-            
+
         Returns:
-            Tuple of (quantized_weights, scales, zeros)
+            Tuple of (quantized_weights, metadata) where quantized_weights is
+            a uint8 array (NOT packed int4 — 1 byte per weight in memory) and
+            metadata is a dict with keys 'scale', 'zero', 'original_shape',
+            'padded', 'pad_size' for use with dequantize_weights().
         """
         shape = weights.shape
         padded = False
@@ -94,10 +107,12 @@ class GroupQuantizer:
         group_min = mx.min(reshaped, axis=-1, keepdims=True)
         group_max = mx.max(reshaped, axis=-1, keepdims=True)
         
-        # Compute scale and zero point
-        scale = (group_max - group_min) / (self.n_levels - 1)
+        # Compute scale and zero point.  Epsilon floor prevents divide-by-
+        # zero (NaN/inf) for constant groups where group_max == group_min.
+        eps = 1e-8
+        scale = mx.maximum((group_max - group_min) / (self.n_levels - 1), eps)
         zero = group_min
-        
+
         # Quantize
         quantized = mx.round((reshaped - zero) / scale)
         quantized = mx.clip(quantized, 0, self.n_levels - 1)
@@ -235,28 +250,42 @@ class ModelQuantizer:
                 return False
         return True
     
-    def quantize_model(
+    def estimate_quantization_savings(
         self,
         model: nn.Module,
         calibration_data: Optional[List[mx.array]] = None
     ) -> Tuple[nn.Module, QuantizationResult]:
         """
-        Quantize model weights
-        
+        ESTIMATE the size savings of quantizing this model.
+
+        HONESTY NOTE — NO WEIGHTS ARE MODIFIED.  This method runs the
+        quantization math per layer to exercise it, but the model is
+        returned UNCHANGED; the QuantizationResult contains projected
+        sizes only.  (This method was previously named `quantize_model`,
+        which computed quantized weights into locals, discarded them, and
+        returned the unmodified model while reporting "compression" stats
+        as if applied.)
+
+        Size accounting assumes PACKED int4 storage (0.5 byte/weight).
+        This framework actually stores quantized values as uint8
+        (1 byte/weight), so the real in-memory ratio is 2x worse than the
+        estimate until packing is implemented.
+
         Args:
-            model: MLX model to quantize
-            calibration_data: Optional calibration samples
-            
+            model: MLX model to analyze
+            calibration_data: Unused (kept for signature compatibility)
+
         Returns:
-            Tuple of (quantized_model, quantization_result)
+            Tuple of (model UNCHANGED, QuantizationResult with projected sizes)
         """
-        print(f"Quantizing model to {self.config.bits}-bit (group_size={self.config.group_size})")
-        
+        print(f"Estimating {self.config.bits}-bit quantization savings "
+              f"(group_size={self.config.group_size}) — no weights are modified")
+
         original_size = 0
         quantized_size = 0
         num_quantized = 0
         num_excluded = 0
-        
+
         # Traverse model layers
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
@@ -265,33 +294,36 @@ class ModelQuantizer:
                     # Get original weights
                     weights = module.weight
                     original_size += weights.size * 2  # FP16 = 2 bytes
-                    
-                    # Quantize
+
+                    # Run the quantization math (result discarded — estimate only)
                     q_weights, q_meta = self.quantizer.quantize_weights(weights)
                     scales = q_meta['scale']
                     zeros = q_meta['zero']
 
-                    # Calculate quantized size
-                    quantized_size += q_weights.size * 0.5  # INT4 = 0.5 bytes (packed)
+                    # Projected size ASSUMING packed int4 (0.5 B/weight).
+                    # Actual uint8 storage in this framework is 1 B/weight.
+                    quantized_size += q_weights.size * 0.5
                     quantized_size += (scales.size + zeros.size) * 2  # FP16 scales/zeros
-                    
+
                     num_quantized += 1
-                    
-                    print(f"  Quantized: {name}")
+
+                    print(f"  Would quantize: {name}")
                 else:
                     # Keep in FP16
                     weights = module.weight
                     original_size += weights.size * 2
                     quantized_size += weights.size * 2
                     num_excluded += 1
-                    
+
                     print(f"  Excluded: {name}")
-        
+
         # Convert to MB
         original_size_mb = original_size / (1024 ** 2)
         quantized_size_mb = quantized_size / (1024 ** 2)
-        compression_ratio = original_size_mb / quantized_size_mb
-        
+        compression_ratio = (
+            original_size_mb / quantized_size_mb if quantized_size_mb > 0 else 1.0
+        )
+
         result = QuantizationResult(
             original_size_mb=original_size_mb,
             quantized_size_mb=quantized_size_mb,
@@ -300,14 +332,15 @@ class ModelQuantizer:
             num_excluded_layers=num_excluded,
             quality_metrics={}
         )
-        
-        print(f"\nQuantization Summary:")
+
+        print(f"\nQuantization Savings Estimate (no weights modified):")
         print(f"  Original size: {original_size_mb:.1f} MB")
-        print(f"  Quantized size: {quantized_size_mb:.1f} MB")
-        print(f"  Compression: {compression_ratio:.2f}x")
-        print(f"  Quantized layers: {num_quantized}")
+        print(f"  Projected size: {quantized_size_mb:.1f} MB "
+              f"(assumes packed int4; uint8 storage would be ~2x)")
+        print(f"  Projected compression: {compression_ratio:.2f}x")
+        print(f"  Layers that would be quantized: {num_quantized}")
         print(f"  Excluded layers: {num_excluded}")
-        
+
         return model, result
     
     def validate_quantization(
@@ -335,13 +368,15 @@ class ModelQuantizer:
             'cosine_similarity': 0.0
         }
         
-        # Compare outputs on test inputs
+        # Compare outputs on test inputs.
+        # Note: MLX has no `mx.no_grad()` context manager (gradients are only
+        # computed via explicit transforms like mx.grad), so plain forward
+        # calls are already inference-only.
         for i, test_input in enumerate(test_inputs[:self.config.calibration_samples]):
             # Forward pass
-            with mx.no_grad():
-                orig_output = original_model(test_input)
-                quant_output = quantized_model(test_input)
-            
+            orig_output = original_model(test_input)
+            quant_output = quantized_model(test_input)
+
             # Compute metrics
             mse = mx.mean((orig_output - quant_output) ** 2).item()
             mae = mx.max(mx.abs(orig_output - quant_output)).item()
@@ -374,51 +409,24 @@ def quantize_llava_model(
     group_size: int = 64
 ) -> QuantizationResult:
     """
-    Convenience function to quantize LLaVA model
-    
-    Args:
-        model_path: Path to original model
-        output_path: Path to save quantized model
-        bits: Quantization bits
-        group_size: Group size for quantization
-        
-    Returns:
-        QuantizationResult with statistics
+    Convenience function to quantize a LLaVA model — NOT IMPLEMENTED.
+
+    Model loading/saving was never implemented, and a previous version of
+    this function returned fully fabricated quality metrics (MSE 0.0012,
+    cosine 0.998) as if measured.  It now raises instead of inventing
+    numbers.
+
+    Raises:
+        NotImplementedError: always — no model loading exists in this repo,
+            and no quality metrics have ever been measured for this path.
     """
-    config = QuantizationConfig(
-        bits=bits,
-        group_size=group_size,
-        exclude_patterns=[
-            "vision_tower.*",      # Keep vision encoder in FP16
-            "mm_projector.*",      # Keep projection in FP16
-            "embed_tokens",        # Keep embeddings in FP16
-            "lm_head"              # Keep output head in FP16
-        ]
+    raise NotImplementedError(
+        "quantize_llava_model is unimplemented scaffolding: model "
+        "loading/saving does not exist in this repo and no quality metrics "
+        "have been measured. Use GroupQuantizer directly on real weight "
+        "arrays, or ModelQuantizer.estimate_quantization_savings() for a "
+        "size projection."
     )
-    
-    quantizer = ModelQuantizer(config)
-    
-    print(f"Loading model from {model_path}...")
-    # TODO: Implement actual model loading
-    # model = load_model(model_path)
-    
-    print("Quantizing model...")
-    # quantized_model, result = quantizer.quantize_model(model)
-    
-    print(f"Saving quantized model to {output_path}...")
-    # save_model(quantized_model, output_path)
-    
-    # Placeholder result for Phase 0
-    result = QuantizationResult(
-        original_size_mb=14600,  # 7B @ FP16
-        quantized_size_mb=4500,  # 7B @ INT4
-        compression_ratio=3.24,
-        num_quantized_layers=32,
-        num_excluded_layers=8,
-        quality_metrics={'mse': 0.0012, 'cosine_similarity': 0.998}
-    )
-    
-    return result
 
 
 if __name__ == "__main__":
@@ -443,10 +451,15 @@ if __name__ == "__main__":
     q_weights, q_meta = quantizer.quantize_weights(test_weights)
     scales = q_meta['scale']
     zeros = q_meta['zero']
-    print(f"Quantized weights shape: {q_weights.shape}")
-    quantized_size = (q_weights.size * 0.5 + (scales.size + zeros.size) * 2) / (1024**2)
-    print(f"Quantized size: {quantized_size:.1f} MB (INT4 + FP16 scales)")
-    print(f"Compression ratio: {(test_weights.size * 2 / (1024**2)) / quantized_size:.2f}x")
+    print(f"Quantized weights shape: {q_weights.shape} (dtype={q_weights.dtype})")
+    # Size accounting: values are STORED as uint8 (1 B/weight); the packed
+    # int4 figure (0.5 B/weight) is a projection, not the actual footprint.
+    stored_size = (q_weights.size * 1.0 + (scales.size + zeros.size) * 2) / (1024**2)
+    packed_size = (q_weights.size * 0.5 + (scales.size + zeros.size) * 2) / (1024**2)
+    print(f"Stored size (uint8 + FP16 scales): {stored_size:.1f} MB")
+    print(f"Projected size if packed int4:     {packed_size:.1f} MB")
+    print(f"Compression ratio (stored): {(test_weights.size * 2 / (1024**2)) / stored_size:.2f}x")
+    print(f"Compression ratio (packed): {(test_weights.size * 2 / (1024**2)) / packed_size:.2f}x")
 
     # Dequantize and check error
     dequantized = quantizer.dequantize_weights(q_weights, q_meta)

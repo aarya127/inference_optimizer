@@ -1,19 +1,39 @@
 """
 Core Performance Metrics for AMIO Phase 0
 
+NOTE: this module is currently not imported by the live service
+(integrated_service.py) — it is standalone instrumentation.
+
 Defines and implements the three primary metrics for multimodal inference optimization:
 1. Time-To-First-Token (TTFT) - Primary bottleneck for multimodal
 2. Time-Between-Tokens (TBT) - Generation smoothness
 3. Memory Fragmentation - Memory waste percentage
+
+Measurement policy:
+- All durations use time.perf_counter() (monotonic); time.time() is used
+  only for epoch timestamps.
+- Total TTFT is WALL TIME from start_ttft_measurement() to
+  end_ttft_measurement(); the per-component times are a breakdown and a
+  warning is printed if the component sum diverges from wall time by >5%.
+- Memory metrics come from the MLX allocator when mlx is importable;
+  otherwise they are reported as unavailable.  No constants are ever
+  emitted as measurements.
 """
 
 import time
-import mlx.core as mx
+import warnings
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import psutil
 import json
+
+try:
+    import mlx.core as mx
+    _MLX_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment without MLX
+    mx = None
+    _MLX_AVAILABLE = False
 
 
 class MetricType(Enum):
@@ -37,18 +57,22 @@ class TTFTMetrics:
     
     # Communication overhead (if TP enabled)
     tp_overhead_ms: float = 0.0
-    
-    # Total TTFT
+
+    # Total TTFT (WALL TIME, measured start→end; authoritative)
     total_ttft_ms: float = 0.0
-    
+    # Sum of the component durations above (breakdown; may differ slightly
+    # from wall time due to un-instrumented gaps)
+    component_sum_ms: float = 0.0
+
     # Metadata
     image_size: Tuple[int, int] = (0, 0)
     prompt_length: int = 0
     batch_size: int = 1
-    
-    def compute_total(self):
-        """Compute total TTFT from components"""
-        self.total_ttft_ms = (
+
+    def compute_component_sum(self) -> float:
+        """Sum the per-component durations (breakdown, NOT the total TTFT —
+        total_ttft_ms is wall time set by end_ttft_measurement)."""
+        self.component_sum_ms = (
             self.image_preprocessing_ms +
             self.vision_encoding_ms +
             self.projection_ms +
@@ -56,8 +80,8 @@ class TTFTMetrics:
             self.first_token_generation_ms +
             self.tp_overhead_ms
         )
-        return self.total_ttft_ms
-    
+        return self.component_sum_ms
+
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
         return {
@@ -68,6 +92,7 @@ class TTFTMetrics:
             'first_token_generation_ms': self.first_token_generation_ms,
             'tp_overhead_ms': self.tp_overhead_ms,
             'total_ttft_ms': self.total_ttft_ms,
+            'component_sum_ms': self.component_sum_ms,
             'image_size': self.image_size,
             'prompt_length': self.prompt_length,
             'batch_size': self.batch_size
@@ -142,7 +167,14 @@ class TBTMetrics:
 
 @dataclass
 class FragmentationMetrics:
-    """Memory fragmentation metrics"""
+    """Memory fragmentation metrics.
+
+    `measurement_available` is False when no real allocator statistics could
+    be read (e.g. MLX not importable) — in that case the MB fields are NOT
+    measurements and must not be reported as such.
+    """
+    measurement_available: bool = False
+    source: str = "unavailable"    # e.g. "mlx_allocator"
     # Memory usage (MB)
     allocated_memory_mb: float = 0.0
     used_memory_mb: float = 0.0
@@ -175,6 +207,8 @@ class FragmentationMetrics:
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
         return {
+            'measurement_available': self.measurement_available,
+            'source': self.source,
             'allocated_memory_mb': self.allocated_memory_mb,
             'used_memory_mb': self.used_memory_mb,
             'wasted_memory_mb': self.wasted_memory_mb,
@@ -239,108 +273,147 @@ class MetricsCollector:
         metrics = collector.get_metrics()
     """
     
+    # Recognized TTFT components → TTFTMetrics attribute
+    _COMPONENT_FIELDS = {
+        "image_preprocessing": "image_preprocessing_ms",
+        "vision_encoding": "vision_encoding_ms",
+        "projection": "projection_ms",
+        "prompt_processing": "prompt_processing_ms",
+        "first_token_generation": "first_token_generation_ms",
+        "tp_overhead": "tp_overhead_ms",
+    }
+
     def __init__(self):
         self.current_metrics = InferenceMetrics()
-        self.ttft_start_time = 0.0
-        self.last_component_time = 0.0
-        self.token_start_time = 0.0
+        self.ttft_start_time = 0.0        # perf_counter seconds
+        self.last_component_time = 0.0    # perf_counter seconds
+        self.token_start_time = 0.0       # perf_counter seconds
         self.measurement_active = False
-        
+
     def start_ttft_measurement(self, request_id: str = ""):
         """Start TTFT measurement"""
-        self.ttft_start_time = time.time()
+        self.ttft_start_time = time.perf_counter()
         self.last_component_time = self.ttft_start_time
         self.measurement_active = True
         self.current_metrics.request_id = request_id
-        self.current_metrics.timestamp = self.ttft_start_time
-        
+        self.current_metrics.timestamp = time.time()   # epoch timestamp only
+
     def mark_component(self, component_name: str) -> float:
         """
-        Mark completion of a TTFT component
-        
+        Mark completion of a TTFT component.
+
         Args:
-            component_name: Name of component (e.g., "vision_encoding")
-            
+            component_name: One of the recognized component names
+                (see MetricsCollector._COMPONENT_FIELDS).
+
         Returns:
-            Component duration in milliseconds
+            Component duration in milliseconds.
+
+        Raises:
+            ValueError: if `component_name` is not a recognized component.
+                (Previously an unknown name silently advanced the clock and
+                recorded nothing — a typo meant silently lost time.)
         """
+        if component_name not in self._COMPONENT_FIELDS:
+            raise ValueError(
+                f"Unknown TTFT component {component_name!r}. "
+                f"Valid components: {sorted(self._COMPONENT_FIELDS)}"
+            )
         if not self.measurement_active:
             return 0.0
-        
-        current_time = time.time()
+
+        current_time = time.perf_counter()
         duration_ms = (current_time - self.last_component_time) * 1000.0
-        
-        # Update corresponding field
-        ttft = self.current_metrics.ttft
-        if component_name == "image_preprocessing":
-            ttft.image_preprocessing_ms = duration_ms
-        elif component_name == "vision_encoding":
-            ttft.vision_encoding_ms = duration_ms
-        elif component_name == "projection":
-            ttft.projection_ms = duration_ms
-        elif component_name == "prompt_processing":
-            ttft.prompt_processing_ms = duration_ms
-        elif component_name == "first_token_generation":
-            ttft.first_token_generation_ms = duration_ms
-        
+
+        setattr(self.current_metrics.ttft,
+                self._COMPONENT_FIELDS[component_name], duration_ms)
+
         self.last_component_time = current_time
         return duration_ms
-    
+
     def end_ttft_measurement(self) -> float:
         """
-        End TTFT measurement and compute total
-        
+        End TTFT measurement.
+
+        total_ttft_ms is the WALL TIME since start_ttft_measurement() —
+        authoritative.  The component sum is kept as a breakdown
+        (component_sum_ms); if it diverges from wall time by more than 5%
+        a warning is emitted (it means un-instrumented time exists or a
+        component was double-marked).
+
         Returns:
-            Total TTFT in milliseconds
+            Total (wall-time) TTFT in milliseconds.
         """
         if not self.measurement_active:
             return 0.0
-        
-        return self.current_metrics.ttft.compute_total()
-    
+
+        ttft = self.current_metrics.ttft
+        wall_ms = (time.perf_counter() - self.ttft_start_time) * 1000.0
+        comp_ms = ttft.compute_component_sum()
+        ttft.total_ttft_ms = wall_ms
+
+        if wall_ms > 0 and abs(wall_ms - comp_ms) / wall_ms > 0.05:
+            warnings.warn(
+                f"TTFT component sum ({comp_ms:.1f} ms) diverges from wall "
+                f"time ({wall_ms:.1f} ms) by "
+                f"{abs(wall_ms - comp_ms) / wall_ms * 100:.1f}% — "
+                f"some time is un-instrumented or double-counted.",
+                stacklevel=2,
+            )
+        return wall_ms
+
     def start_token_measurement(self):
         """Start measuring time for next token"""
-        self.token_start_time = time.time()
-    
+        self.token_start_time = time.perf_counter()
+
     def end_token_measurement(self) -> float:
         """
         End token measurement and record latency
-        
+
         Returns:
             Token latency in milliseconds
         """
-        latency_ms = (time.time() - self.token_start_time) * 1000.0
+        latency_ms = (time.perf_counter() - self.token_start_time) * 1000.0
         self.current_metrics.tbt.add_token_latency(latency_ms)
         return latency_ms
-    
+
     def measure_memory(self):
-        """Measure current memory usage and fragmentation"""
-        # System memory
+        """Measure current memory usage from real sources only.
+
+        System memory comes from psutil.  Allocator-level memory comes from
+        the MLX allocator (mx.get_active_memory / mx.get_peak_memory /
+        mx.get_cache_memory) when mlx is importable; otherwise the
+        fragmentation block is marked `measurement_available=False` and no
+        numbers are fabricated.  (A previous version returned hardcoded
+        LLaVA-7B constants here, so "fragmentation" was always exactly
+        13.04% regardless of what ran.)
+        """
+        # System memory (real, via psutil)
         mem = psutil.virtual_memory()
         frag = self.current_metrics.fragmentation
-        
+
         frag.system_memory_total_gb = mem.total / (1024 ** 3)
         frag.system_memory_available_gb = mem.available / (1024 ** 3)
         frag.system_memory_percent = mem.percent
-        
-        # TODO: Implement MLX-specific memory tracking
-        # For Phase 0, use estimates based on model config
-        
-        # Placeholder: estimate from known model size
-        frag.model_weights_mb = 4500  # INT4 LLaVA-7B
-        frag.kv_cache_mb = 256        # 1K tokens
-        frag.activations_mb = 400     # Forward pass
-        
-        frag.used_memory_mb = (
-            frag.model_weights_mb +
-            frag.kv_cache_mb +
-            frag.activations_mb
-        )
-        
-        # Estimate allocated (with fragmentation)
-        frag.allocated_memory_mb = frag.used_memory_mb * 1.15  # 15% overhead
-        
-        frag.compute_fragmentation()
+
+        if _MLX_AVAILABLE:
+            try:
+                active_bytes = float(mx.get_active_memory())
+                cache_bytes = float(mx.get_cache_memory())
+                frag.used_memory_mb = active_bytes / (1024 ** 2)
+                # Allocator holds active buffers + cached (freed but retained)
+                frag.allocated_memory_mb = (active_bytes + cache_bytes) / (1024 ** 2)
+                frag.measurement_available = True
+                frag.source = "mlx_allocator"
+                frag.compute_fragmentation()
+            except Exception:
+                frag.measurement_available = False
+                frag.source = "unavailable (mlx allocator query failed)"
+        else:
+            # No allocator statistics available — report unavailable rather
+            # than emitting constants as measurements.
+            frag.measurement_available = False
+            frag.source = "unavailable (mlx not importable)"
     
     def finalize_metrics(self) -> InferenceMetrics:
         """
@@ -382,24 +455,36 @@ class MetricsAggregator:
         self.metrics_history.append(metrics)
     
     def compute_summary(self) -> Dict:
-        """Compute summary statistics across all requests"""
+        """Compute summary statistics across all requests.
+
+        Tail TBT metrics (p95/p99) are computed over the POOLED per-token
+        latencies of all requests — a percentile of per-request means (the
+        previous behavior) systematically understates tail latency because
+        averaging within a request hides its slow tokens.
+        """
         if not self.metrics_history:
             return {}
-        
+
         import numpy as np
-        
-        # Extract TTFT values
+
+        # Extract TTFT values (wall-time totals)
         ttft_values = [m.ttft.total_ttft_ms for m in self.metrics_history]
-        
-        # Extract TBT values
-        tbt_values = [m.tbt.mean_tbt_ms for m in self.metrics_history 
-                     if m.tbt.mean_tbt_ms > 0]
-        
-        # Extract fragmentation values
-        frag_values = [m.fragmentation.fragmentation_percent 
-                      for m in self.metrics_history
-                      if m.fragmentation.fragmentation_percent > 0]
-        
+
+        # Pool per-token latencies across ALL requests for tail metrics
+        pooled_token_latencies: List[float] = []
+        for m in self.metrics_history:
+            pooled_token_latencies.extend(m.tbt.token_latencies)
+
+        # Per-request means (still useful as a central-tendency view)
+        tbt_request_means = [m.tbt.mean_tbt_ms for m in self.metrics_history
+                             if m.tbt.mean_tbt_ms > 0]
+
+        # Extract fragmentation values (real measurements only)
+        frag_values = [m.fragmentation.fragmentation_percent
+                       for m in self.metrics_history
+                       if m.fragmentation.measurement_available
+                       and m.fragmentation.fragmentation_percent > 0]
+
         summary = {
             'num_requests': len(self.metrics_history),
             'ttft': {
@@ -411,17 +496,23 @@ class MetricsAggregator:
                 'max_ms': float(np.max(ttft_values)) if ttft_values else 0,
             },
             'tbt': {
-                'mean_ms': float(np.mean(tbt_values)) if tbt_values else 0,
-                'median_ms': float(np.median(tbt_values)) if tbt_values else 0,
-                'p95_ms': float(np.percentile(tbt_values, 95)) if tbt_values else 0,
-                'p99_ms': float(np.percentile(tbt_values, 99)) if tbt_values else 0,
+                # mean/median of per-request means (central tendency)
+                'mean_ms': float(np.mean(tbt_request_means)) if tbt_request_means else 0,
+                'median_ms': float(np.median(tbt_request_means)) if tbt_request_means else 0,
+                # tails from pooled per-token latencies across all requests
+                'p95_ms': float(np.percentile(pooled_token_latencies, 95))
+                          if pooled_token_latencies else 0,
+                'p99_ms': float(np.percentile(pooled_token_latencies, 99))
+                          if pooled_token_latencies else 0,
+                'num_tokens_pooled': len(pooled_token_latencies),
             },
             'fragmentation': {
-                'mean_percent': float(np.mean(frag_values)) if frag_values else 0,
-                'max_percent': float(np.max(frag_values)) if frag_values else 0,
+                'measurements_available': len(frag_values),
+                'mean_percent': float(np.mean(frag_values)) if frag_values else None,
+                'max_percent': float(np.max(frag_values)) if frag_values else None,
             }
         }
-        
+
         return summary
     
     def export_to_json(self, filepath: str):
@@ -489,9 +580,24 @@ if __name__ == "__main__":
     
     print("\nFinal Metrics:")
     print("-" * 80)
-    print(f"  TTFT: {metrics.ttft.total_ttft_ms:.1f} ms")
+    print(f"  TTFT (wall): {metrics.ttft.total_ttft_ms:.1f} ms  "
+          f"(component sum: {metrics.ttft.component_sum_ms:.1f} ms)")
     print(f"  Mean TBT: {metrics.tbt.mean_tbt_ms:.1f} ms")
     print(f"  Throughput: {metrics.tbt.tokens_per_second:.1f} tok/s")
-    print(f"  Memory Fragmentation: {metrics.fragmentation.fragmentation_percent:.1f}%")
-    
+    if metrics.fragmentation.measurement_available:
+        print(f"  Memory Fragmentation: "
+              f"{metrics.fragmentation.fragmentation_percent:.1f}%  "
+              f"(source: {metrics.fragmentation.source})")
+    else:
+        print(f"  Memory Fragmentation: unavailable "
+              f"({metrics.fragmentation.source})")
+
+    # Unknown component names must raise (not silently advance the clock)
+    try:
+        collector.start_ttft_measurement("test-002")
+        collector.mark_component("visoin_encoding")   # deliberate typo
+        raise AssertionError("expected ValueError for unknown component")
+    except ValueError:
+        print("\n  PASS: unknown component name raises ValueError")
+
     print("\nMetrics collection test complete")

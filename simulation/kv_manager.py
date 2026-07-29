@@ -1,57 +1,75 @@
 """
 KV Cache Manager — Dual-Backend Simulation (Phase 4)
 
-Implements and compares two KV cache allocation strategies:
+Implements and compares two *assumed* KV cache allocation policies:
 
-  ContiguousBackend  — static pre-allocation to max_seq_len.  Simple but
-                       wastes 60–80% of memory via fragmentation and over-
-                       reservation.  Mirrors SmolVLM baseline (results.json:
-                       kv_allocated_mb=216, fragmentation=22.2% at 1548 tokens).
+  ContiguousBackend  — static pre-allocation: every sequence reserves
+                       max_seq_len tokens of KV up front, regardless of
+                       actual usage.
+  PagedBackend       — PagedAttention-style block table: KV is split into
+                       fixed-size physical blocks (PAGE_SIZE tokens each)
+                       allocated on demand; only the last block of a
+                       sequence can be partially filled.
 
-  PagedBackend       — PagedAttention-style block table.  KV cache is split
-                       into fixed-size physical blocks (PAGE_SIZE tokens each).
-                       A logical→physical block table maps sequence positions
-                       to non-contiguous blocks.  Target: fragmentation < 4%.
+IMPORTANT — what "fragmentation" means here
+-------------------------------------------
+The "fragmentation" this module reports is *over-reservation under the two
+assumed allocation policies above* (contiguous always reserves max_seq_len;
+paged reserves exact-fit blocks). It is a POLICY COMPARISON, not a measured
+allocator behavior: whether MLX's real allocator actually pre-allocates to
+max_seq_len was never established (it grows buffers in steps). The
+contiguous-vs-paged gap is therefore a consequence of the definitions, not
+an empirical finding about the runtime.
 
-Hardware / model constants (derived from Phase 1 measurements)
---------------------------------------------------------------
-  n_layers    = 24        (SmolVLM LM depth)
-  hidden_size = 1152      (KV head dimension: calibrated from kv_cache_mb data)
-  dtype_bytes = 2         (FP16 baseline)
-  max_seq_len = 2048      (pre-allocation ceiling for contiguous backend)
-  kv_per_tok  = 110,592 bytes/token (= 2 × 24 × 1152 × 2)
+Constants are imported from `amio_constants` (single source of truth,
+derived from the shipped checkpoint's config.json). The previous version of
+this module used a fabricated architecture (hidden 1152 → 110,592 B/token)
+whose "verification" against results.json was circular — the hidden size had
+been back-derived from the same kv_cache_mb figures it was checked against.
 
-Verification:  kv_per_tok × 2048 = 226,492,416 B = 216.0 MB  (matches results.json)
+Exception contract: pool exhaustion always raises MemoryError (see
+PagedBackend.allocate).
 """
 
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# repo root on path so `import amio_constants` works when this file is run
+# directly (python simulation/kv_manager.py) as well as via package imports.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import amio_constants as _C
+
 
 # ---------------------------------------------------------------------------
-# Model / hardware constants
+# Model / hardware constants — assigned from amio_constants so existing
+# importers (controller.py, batching_engine.py, generate_report.py, tests)
+# keep working with the corrected values.
 # ---------------------------------------------------------------------------
-LM_N_LAYERS: int = 24
-LM_HIDDEN_SIZE: int = 1152          # KV hidden dimension (empirically derived)
-LM_DTYPE_BYTES: int = 2             # FP16
-MAX_SEQ_LEN: int = 2048             # contiguous backend ceiling
-PAGE_SIZE: int = 16                 # tokens per paged block (standard vLLM default)
-M3_TOTAL_MEMORY_MB: float = 8192.0  # M3 8 GB unified memory
-MODEL_WEIGHTS_MB: float = 250.0     # SmolVLM 4-bit weights (≈ 500 M params × 0.5 B)
-VISION_WEIGHTS_MB: float = 200.0    # SigLIP 4-bit vision encoder
-OS_OVERHEAD_MB: float = 2048.0      # OS + framework overhead
+LM_N_LAYERS: int = _C.LM_NUM_LAYERS          # 24
+LM_HIDDEN_SIZE: int = _C.LM_HIDDEN_SIZE      # 2048 (kv_heads × head_dim; MHA)
+LM_DTYPE_BYTES: int = 2                      # FP16 baseline
+MAX_SEQ_LEN: int = 2048                      # contiguous backend ceiling
+PAGE_SIZE: int = 16                          # tokens per paged block (vLLM default)
+M3_TOTAL_MEMORY_MB: float = _C.TOTAL_MEMORY_MB       # 8192
+MODEL_WEIGHTS_MB: float = _C.MODEL_WEIGHTS_MB        # 1390 (vision + LM, 4-bit, measured)
+VISION_WEIGHTS_MB: float = 0.0               # included in MODEL_WEIGHTS_MB (kept for compat)
+OS_OVERHEAD_MB: float = _C.OS_RESERVE_MB     # 2048 (modeling assumption)
 
-# Bytes required to store KV for one token across all layers (FP16)
-KV_BYTES_PER_TOKEN: int = 2 * LM_N_LAYERS * LM_HIDDEN_SIZE * LM_DTYPE_BYTES
-# = 2 × 24 × 1152 × 2 = 110,592 bytes / token
+# Bytes required to store KV for one token across all layers (FP16):
+#   2 (K+V) × layers × kv_heads × head_dim × 2 B = 196,608 B/token
+KV_BYTES_PER_TOKEN: int = _C.KV_BYTES_PER_TOKEN_FP16
+KV_BYTES_PER_TOKEN_W4: int = _C.KV_BYTES_PER_TOKEN_W4   # 49,152 (modeled)
 
-# Available memory budget for KV pool
-KV_POOL_BUDGET_MB: float = (
-    M3_TOTAL_MEMORY_MB - MODEL_WEIGHTS_MB - VISION_WEIGHTS_MB - OS_OVERHEAD_MB
-)
+# Available memory budget for the KV pool (8192 − 1390 − 2048 = 4754 MB)
+KV_POOL_BUDGET_MB: float = _C.KV_POOL_BUDGET_MB
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +87,7 @@ class KVAllocationResult:
     n_blocks: int                 # physical blocks in use (paged) or 1 (contiguous)
     waste_bytes: int              # allocated - used, in bytes
     notes: str = ""
+    seq_id: int = -1              # backend-assigned sequence id (use for free())
 
     @property
     def efficiency_pct(self) -> float:
@@ -81,10 +100,12 @@ class KVAllocationResult:
 
 class ContiguousBackend:
     """
-    Baseline static allocator.  One contiguous buffer per sequence, sized to
-    max_seq_len regardless of actual usage.
+    Baseline static allocation POLICY (assumed, not measured): one contiguous
+    buffer per sequence, always sized to max_seq_len regardless of actual
+    usage.  The over-reservation this produces is definitional — see the
+    module docstring.
 
-    Fragmentation formula from the spec:
+    Fragmentation formula:
         Frag = (Allocated − Used) / Allocated
     """
 
@@ -128,7 +149,12 @@ class ContiguousBackend:
             n_blocks=1,
             waste_bytes=waste_bytes,
             notes=f"pre-allocated {self.max_seq_len} tokens, used {seq_len}",
+            seq_id=seq_id,
         )
+
+    def free(self, seq_id: int) -> None:
+        """Release a sequence's reservation (bookkeeping only)."""
+        self._sequences.pop(seq_id, None)
 
     def max_concurrent_seqs(self, pool_budget_mb: float = KV_POOL_BUDGET_MB) -> int:
         """How many sequences fit in the available KV pool?"""
@@ -175,7 +201,7 @@ class BlockTable:
 
 class PagedBackend:
     """
-    PagedAttention-style block allocator.
+    PagedAttention-style block allocation POLICY (assumed exact-fit).
 
     Memory is split into a pool of fixed-size physical blocks.  Each sequence
     maintains a BlockTable that maps its logical token positions to physical
@@ -185,6 +211,11 @@ class PagedBackend:
     partially filled.  Maximum waste = PAGE_SIZE − 1 tokens per sequence.
 
         Frag = sum(waste_per_seq) / sum(allocated_per_seq)
+
+    Exception contract
+    ------------------
+    Pool exhaustion ALWAYS raises ``MemoryError`` (never RuntimeError).
+    Callers must catch ``MemoryError``.
     """
 
     def __init__(
@@ -226,11 +257,36 @@ class PagedBackend:
         """
         Allocate physical blocks for `seq_len` tokens.
 
-        Returns a KVAllocationResult tracking actual usage vs allocated bytes.
+        The returned ``KVAllocationResult.seq_id`` is the backend-assigned
+        sequence id — pass it to :meth:`free` to release the blocks.  Callers
+        must use this id instead of mirroring the internal counter.
+
+        Atomicity: capacity is checked BEFORE any state is mutated.  On
+        failure, no blocks are consumed and the seq_id counter does not
+        advance, so a failed allocation leaks nothing.
+
+        Raises
+        ------
+        MemoryError
+            If the pool does not have enough free blocks.  This is the ONLY
+            exception type used for pool exhaustion — catch ``MemoryError``,
+            not RuntimeError.
+        ValueError
+            If seq_len is not positive.
         """
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {seq_len}")
+
         n_blocks_needed = math.ceil(seq_len / self.page_size)
 
-        # Allocate blocks and build block table
+        # ── Transactional check: fail BEFORE mutating any state ──────────
+        if n_blocks_needed > len(self._free_blocks):
+            raise MemoryError(
+                f"KV pool exhausted — need {n_blocks_needed} blocks, "
+                f"only {len(self._free_blocks)} free."
+            )
+
+        # ── Commit: safe to mutate now ────────────────────────────────────
         seq_id = self._next_seq_id
         self._next_seq_id += 1
         table = BlockTable(seq_id=seq_id, seq_len=seq_len)
@@ -266,6 +322,7 @@ class PagedBackend:
                 f"PageSize={self.page_size}: {n_blocks_needed} blocks "
                 f"({waste_bytes // self.kv_bytes_per_token} wasted tokens in last block)"
             ),
+            seq_id=seq_id,
         )
 
     def free(self, seq_id: int) -> None:
@@ -313,25 +370,29 @@ def kv_cache_size_mb(
     batch_size: int = 1,
     n_layers: int = LM_N_LAYERS,
     hidden_size: int = LM_HIDDEN_SIZE,
-    dtype_bytes: int = LM_DTYPE_BYTES,
+    dtype_bytes: Optional[int] = None,
     quantization_bits: int = 16,
 ) -> float:
     """
-    Compute KV cache memory in MB for given config.
+    Compute KV cache memory in MB for a given config.
 
     Parameters
     ----------
     seq_len           : sequence length (visual + text tokens)
     batch_size        : number of concurrent requests
-    n_layers, hidden_size, dtype_bytes : model architecture
+    n_layers, hidden_size : model architecture (hidden_size = kv_heads × head_dim)
+    dtype_bytes       : DEPRECATED AND IGNORED.  Element size is derived
+                        solely from `quantization_bits` (16 → 2 B, 8 → 1 B,
+                        4 → 0.5 B).  The previous implementation multiplied
+                        dtype_bytes AND divided by a quantization factor,
+                        double-counting compression when both were supplied.
     quantization_bits : 16 (FP16), 8 (INT8/FP8), or 4 (INT4)
 
     Returns
     -------
     KV cache size in MB.
     """
-    quant_factor = 16 / quantization_bits
-    bytes_per_token = 2 * n_layers * hidden_size * dtype_bytes / quant_factor
+    bytes_per_token = 2 * n_layers * hidden_size * (quantization_bits / 8.0)
     total_bytes = bytes_per_token * seq_len * batch_size
     return total_bytes / (1024 ** 2)
 
@@ -342,7 +403,7 @@ def kv_scenario_matrix(
     quant_bits: List[int] | None = None,
 ) -> List[dict]:
     """
-    Print a matrix of KV cache sizes for M3 planning.
+    Build a matrix of KV cache sizes for M3 planning.
 
     Returns a list of dicts with keys:
         seq_len, batch_size, quant_bits, kv_mb, fits_in_budget
@@ -374,6 +435,12 @@ def compare_backends(
 ) -> List[Tuple[KVAllocationResult, KVAllocationResult]]:
     """
     Return (contiguous_result, paged_result) pairs for each seq_len.
+
+    NOTE: the figures produced here are PER-ALLOCATION waste under each
+    policy (over-reservation for one sequence), not pool-level fragmentation
+    of a loaded allocator.  Paged allocations are freed between lengths so
+    each row is an independent single-sequence measurement rather than a
+    cumulative pool state.
     """
     contiguous = ContiguousBackend()
     paged = PagedBackend()
@@ -383,6 +450,10 @@ def compare_backends(
         c_res = contiguous.allocate(s)
         p_res = paged.allocate(s)
         pairs.append((c_res, p_res))
+        # Release so each row is an independent per-allocation figure and
+        # the pool cannot exhaust across the sweep.
+        paged.free(p_res.seq_id)
+        contiguous.free(c_res.seq_id)
     return pairs
 
 
@@ -393,19 +464,20 @@ def compare_backends(
 if __name__ == "__main__":
     print("=" * 72)
     print("AMIO Phase 4 — KV Manager Dual-Backend Comparison")
+    print("(policy comparison of assumed allocators — not measured runtime behavior)")
     print("=" * 72)
 
     # --- Hardware budget summary ---
     print(f"\nM3 KV Pool Budget: {KV_POOL_BUDGET_MB:.0f} MB")
     print(f"  Total memory   : {M3_TOTAL_MEMORY_MB:.0f} MB")
-    print(f"  Model weights  : {MODEL_WEIGHTS_MB:.0f} MB")
-    print(f"  Vision encoder : {VISION_WEIGHTS_MB:.0f} MB")
-    print(f"  OS overhead    : {OS_OVERHEAD_MB:.0f} MB")
+    print(f"  Model weights  : {MODEL_WEIGHTS_MB:.0f} MB  (vision + LM, 4-bit, measured from safetensors)")
+    print(f"  OS reserve     : {OS_OVERHEAD_MB:.0f} MB  (modeling assumption)")
     print(f"  KV bytes/token : {KV_BYTES_PER_TOKEN:,} B  "
-          f"(2 × {LM_N_LAYERS} layers × {LM_HIDDEN_SIZE} hidden × {LM_DTYPE_BYTES} B FP16)")
+          f"(2 × {LM_N_LAYERS} layers × {LM_HIDDEN_SIZE} (kv_heads×head_dim) × {LM_DTYPE_BYTES} B FP16)")
 
     # --- Backend comparison table ---
     print()
+    print("  Per-allocation waste under each policy (not pool-level fragmentation):")
     print(f"  {'seq_len':>7}  "
           f"{'Contiguous alloc':>16}  {'Contig frag%':>12}  "
           f"{'Paged alloc':>11}  {'Paged frag%':>11}")
@@ -419,6 +491,25 @@ if __name__ == "__main__":
             f"{p.kv_allocated_mb:>9.2f} MB  {p.fragmentation_pct:>9.2f}%  {match}"
         )
 
+    # --- Transactional allocation invariants ---
+    print()
+    print("  Transactional-allocate invariants:")
+    small = PagedBackend(pool_budget_mb=10.0)  # tiny pool (~3 blocks)
+    free_before = small.free_blocks
+    ctr_before = small._next_seq_id
+    try:
+        small.allocate(10 ** 6)                # cannot fit
+        raise AssertionError("expected MemoryError")
+    except MemoryError:
+        pass
+    assert small.free_blocks == free_before, "failed allocate leaked blocks"
+    assert small._next_seq_id == ctr_before, "failed allocate advanced seq_id"
+    ok = small.allocate(16)
+    assert ok.seq_id >= 0
+    small.free(ok.seq_id)
+    assert small.free_blocks == free_before, "free() did not return all blocks"
+    print("    PASS — failed allocation mutates no state; seq_id returned in result")
+
     # --- Max concurrent sequences ---
     print()
     cb = ContiguousBackend()
@@ -426,7 +517,7 @@ if __name__ == "__main__":
     print(f"  Max concurrent seqs (seq_len=1548, FP16 KV):")
     print(f"    Contiguous : {cb.max_concurrent_seqs()}")
     print(f"    Paged      : {pb.max_concurrent_seqs(1548)}")
-    print(f"    Paged (W4) : {PagedBackend(kv_bytes_per_token=KV_BYTES_PER_TOKEN//4).max_concurrent_seqs(1548)}")
+    print(f"    Paged (W4) : {PagedBackend(kv_bytes_per_token=KV_BYTES_PER_TOKEN_W4).max_concurrent_seqs(1548)}")
 
     # --- KV scenario matrix (M3, selected rows) ---
     print()

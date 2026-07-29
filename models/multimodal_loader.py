@@ -1,18 +1,24 @@
 """
-MLX-based Multimodal Model Loader for AMIO Phase 0
+MLX-based Multimodal Model Loader — UNUSED SCAFFOLDING (Phase 0)
 
-Supports:
-- LLaVA-1.5-7B with 4-bit quantization
-- Qwen-VL-7B (alternative)
-- Custom CLIP + LLaMA baseline
+*** THIS MODULE IS UNUSED SCAFFOLDING AND PERFORMS NO REAL MODEL WORK. ***
 
-Designed for Apple Silicon M3 with unified memory.
+- It is NOT imported by the live service (integrated_service.py) or by any
+  simulation/evaluation code in this repo.
+- It targets LLaVA-1.5-7B / Qwen-VL — NOT the SmolVLM-Instruct-4bit
+  checkpoint the study actually uses.
+- "Loading" only assigns Python config dicts (no weights are read from
+  disk); there was never a real vision encoder, projection, or LM here.
+- `encode_image` and `generate` previously returned fake outputs
+  (mx.zeros embeddings and a canned f-string); they now raise
+  NotImplementedError so fake outputs cannot leak into results.
+- `memory_usage` / `estimate_memory_footprint` return THEORETICAL
+  LLaVA-class estimates, clearly not measurements.
+
+Kept only as a design sketch for a future real loader.
 """
 
 import mlx.core as mx
-import mlx.nn as nn
-from mlx_lm import load as load_language_model
-from mlx_lm import generate as mlx_generate
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
@@ -154,26 +160,21 @@ class LLaVAModel(MultimodalModel):
     
     def encode_image(self, image: mx.array) -> mx.array:
         """
-        Encode image to embeddings
-        
-        Args:
-            image: mx.array of shape [batch, 3, 336, 336]
-            
-        Returns:
-            Image embeddings of shape [batch, num_patches, hidden_dim]
+        Encode image to embeddings — NOT IMPLEMENTED.
+
+        No vision encoder exists in this module.  A previous version
+        returned mx.zeros dummy embeddings here, which could silently leak
+        fake data into anything downstream.
+
+        Raises:
+            NotImplementedError: always.
         """
-        # TODO: Implement actual vision encoding
-        # Placeholder implementation for Phase 0
-        
-        batch_size = image.shape[0] if len(image.shape) > 3 else 1
-        num_patches = 576  # 24x24 patches for 336x336 image
-        hidden_dim = 1024
-        
-        # Placeholder: return dummy embeddings
-        embeddings = mx.zeros((batch_size, num_patches, hidden_dim))
-        
-        return embeddings
-    
+        raise NotImplementedError(
+            "LLaVAModel.encode_image is unimplemented scaffolding — no "
+            "vision encoder is loaded (loading only assigns config dicts). "
+            "A previous version returned mx.zeros placeholder embeddings."
+        )
+
     def generate(
         self,
         image_embeddings: mx.array,
@@ -182,22 +183,20 @@ class LLaVAModel(MultimodalModel):
         temperature: float = 0.7
     ) -> str:
         """
-        Generate text response from image embeddings and prompt
-        
-        Args:
-            image_embeddings: Encoded image features [batch, num_patches, hidden_dim]
-            text_prompt: Text prompt string
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            
-        Returns:
-            Generated text string
+        Generate text from image embeddings and prompt — NOT IMPLEMENTED.
+
+        No language model exists in this module.  A previous version
+        returned a canned f-string here as if it were model output.
+
+        Raises:
+            NotImplementedError: always.
         """
-        # TODO: Implement actual generation
-        # Placeholder implementation for Phase 0
-        
-        return f"[Generated response for prompt: {text_prompt[:50]}...]"
-    
+        raise NotImplementedError(
+            "LLaVAModel.generate is unimplemented scaffolding — no language "
+            "model is loaded. A previous version returned a canned string "
+            "as fake output."
+        )
+
     def memory_usage(self) -> Dict[str, float]:
         """
         Estimate current memory usage

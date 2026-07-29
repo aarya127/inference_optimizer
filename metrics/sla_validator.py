@@ -44,10 +44,23 @@ class SLAViolation:
 
 
 class SLAValidator:
-    """Validates metrics against SLA targets"""
-    
+    """Validates metrics against SLA targets.
+
+    Bookkeeping:
+    - `checks_performed` counts every validate_* invocation, so the
+      compliance rate has a real denominator (a previous version invented
+      one — `len(violations) + 10` — which double-weighted criticals and
+      could go negative).
+    - Warnings trigger AT the target value: threshold_warning == target for
+      every SLATarget below, so a measurement between the target and the
+      critical threshold is reported instead of silently passing.
+    - `validate_all` resets accumulated violations/checks at the start, so
+      reusing one validator instance does not double-count.
+    """
+
     def __init__(self):
-        # Define SLA targets
+        # Define SLA targets. threshold_warning == target_value by design:
+        # anything over target at least warns (no hidden margin).
         self.targets = {
             'ttft_p95_ms': SLATarget(
                 metric_name='ttft_p95_ms',
@@ -67,19 +80,20 @@ class SLAValidator:
                 metric_name='tbt_mean_ms',
                 target_value=50.0,
                 percentile='mean',
-                threshold_warning=60.0,
+                threshold_warning=50.0,
                 threshold_critical=80.0
             ),
             'fragmentation_percent': SLATarget(
                 metric_name='fragmentation_percent',
                 target_value=20.0,
-                threshold_warning=25.0,
+                threshold_warning=20.0,
                 threshold_critical=30.0
             )
         }
-        
+
         self.violations: List[SLAViolation] = []
-        
+        self.checks_performed: int = 0
+
     def validate_ttft(self, ttft_ms: float, percentile: str = 'p95') -> Optional[SLAViolation]:
         """
         Validate TTFT against target
@@ -93,7 +107,8 @@ class SLAValidator:
         """
         target_key = f'ttft_{percentile}_ms'
         target = self.targets[target_key]
-        
+        self.checks_performed += 1
+
         if ttft_ms > target.threshold_critical:
             violation = SLAViolation(
                 violation_type=SLAViolationType.TTFT_EXCEEDED,
@@ -132,7 +147,8 @@ class SLAValidator:
             SLAViolation if violated, None otherwise
         """
         target = self.targets['tbt_mean_ms']
-        
+        self.checks_performed += 1
+
         if tbt_ms > target.threshold_critical:
             violation = SLAViolation(
                 violation_type=SLAViolationType.TBT_DEGRADED,
@@ -171,7 +187,8 @@ class SLAValidator:
             SLAViolation if violated, None otherwise
         """
         target = self.targets['fragmentation_percent']
-        
+        self.checks_performed += 1
+
         if frag_percent > target.threshold_critical:
             violation = SLAViolation(
                 violation_type=SLAViolationType.FRAGMENTATION_HIGH,
@@ -205,12 +222,17 @@ class SLAValidator:
         
         Args:
             metrics_summary: Dictionary with aggregated metrics
-            
+
         Returns:
             List of violations found
         """
+        # Reset accumulated state so reusing the same validator instance
+        # does not double-count violations or checks across calls.
+        self.violations = []
+        self.checks_performed = 0
+
         violations = []
-        
+
         # Validate TTFT
         if 'ttft' in metrics_summary:
             ttft = metrics_summary['ttft']
@@ -238,18 +260,35 @@ class SLAValidator:
         return violations
     
     def get_compliance_rate(self) -> float:
-        """Calculate SLA compliance rate"""
-        if not self.violations:
-            return 100.0
-        
-        # Count critical violations as double
-        critical_count = sum(2 for v in self.violations if v.severity == 'critical')
-        warning_count = sum(1 for v in self.violations if v.severity == 'warning')
-        
-        total_checks = len(self.violations) + 10  # Assume 10 checks
-        passed_checks = total_checks - (critical_count + warning_count)
-        
-        return (passed_checks / total_checks) * 100.0
+        """SLA compliance rate in [0, 1].
+
+        Defined as 1 − violations/checks over the REAL number of checks
+        performed by validate_* calls (self.checks_performed).  Each check
+        produces at most one violation, so the result is always in [0, 1].
+        Severity does not affect this rate — see
+        get_severity_weighted_score() for a weighted view.
+
+        Returns 1.0 when no checks have been performed yet.
+        """
+        if self.checks_performed == 0:
+            return 1.0
+        return 1.0 - len(self.violations) / self.checks_performed
+
+    def get_severity_weighted_score(self, critical_weight: float = 2.0) -> float:
+        """Severity-weighted penalty score in [0, 1] (1.0 = clean).
+
+        This is NOT the compliance rate: criticals are weighted
+        `critical_weight`× relative to warnings, and the result is clamped
+        at 0.  Use get_compliance_rate() for the plain violations/checks
+        fraction.
+        """
+        if self.checks_performed == 0:
+            return 1.0
+        penalty = sum(
+            critical_weight if v.severity == 'critical' else 1.0
+            for v in self.violations
+        )
+        return max(0.0, 1.0 - penalty / (self.checks_performed * critical_weight))
     
     def print_violations(self):
         """Print all violations"""
@@ -271,7 +310,9 @@ class SLAValidator:
             print()
         
         compliance_rate = self.get_compliance_rate()
-        print(f"Compliance Rate: {compliance_rate:.1f}%")
+        print(f"Compliance Rate: {compliance_rate * 100:.1f}%  "
+              f"({len(self.violations)} violations / "
+              f"{self.checks_performed} checks)")
         print(f"{'='*80}\n")
     
     def export_report(self, filepath: str):
@@ -296,7 +337,9 @@ class SLAValidator:
                 }
                 for v in self.violations
             ],
-            'compliance_rate': self.get_compliance_rate()
+            'checks_performed': self.checks_performed,
+            'compliance_rate': self.get_compliance_rate(),          # 0..1
+            'severity_weighted_score': self.get_severity_weighted_score(),  # 0..1
         }
         
         with open(filepath, 'w') as f:

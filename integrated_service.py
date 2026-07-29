@@ -1,8 +1,15 @@
 """
-integrated_service.py  —  Phase 7: Full System Integration
+integrated_service.py  —  Phase 7: Full System Integration (SIMULATION)
+
+*** SIMULATION SERVICE — NO MODEL IS LOADED. ***
+No vision encoder, language model, or tokenizer is ever instantiated by this
+file.  Every latency it reports is an analytic cost-model formula evaluated
+with Gaussian noise; worker threads sleep for their simulated durations so
+that wall-clock timing reflects modeled load, but no inference occurs and
+all completion text is a placeholder.
 
 Combines the Phase 6 Adaptive Controller (the "brain") with the Phase 3–5
-hardware engines (the "muscle") into a single production-grade service.
+simulated hardware engines (the "muscle") into a single pipelined service.
 
 Architecture
 ============
@@ -15,16 +22,34 @@ Architecture
   │  │  Worker  │──▶│  Worker  │──▶│  Worker  │──▶ Done    │
   │  │ (Thread) │   │ (Thread) │   │ (Thread) │   Queue    │
   │  └──────────┘   └──────────┘   └──────────┘            │
-  │       ▲                ▲              ▲                  │
-  │  Phase 3 SMs     Phase 6 ParVTS  Phase 4 Paged KV       │
-  │                                                          │
+  │       ▲                ▲              ▲          ▲       │
+  │  Phase 3 shares  Phase 6 ParVTS  Phase 4 Paged  Collector│
+  │                                       KV        (Thread) │
   │  Phase 6 AdaptiveController  (called at admission)       │
   └─────────────────────────────────────────────────────────┘
              ▲
   ┌──────────┴──────────────────────────────────────────────┐
-  │   OpenAI-compatible API  POST /v1/multimodal/chat/...   │
+  │   OpenAI-format API  POST /v1/multimodal/chat/...       │
   │   X-AMIO-* telemetry headers + _amio_telemetry field    │
+  │   (all telemetry labeled "simulated" — nothing measured │
+  │    from a real model)                                    │
   └─────────────────────────────────────────────────────────┘
+
+Four worker threads run the pipeline: VisionWorker, PrefillWorker,
+DecodeWorker, and the Collector.  The stage queues are standard blocking
+queues (get() blocks until an item or sentinel arrives).
+
+Timing definitions
+------------------
+  simulated_stage_ttft_ms : sum of the simulated vision + prefill +
+                            migration stage formulas (excludes queue wait
+                            and the first decode step).
+  wall_ttft_ms            : wall-clock time from submit() to collection,
+                            i.e. queue wait + slept stage durations + one
+                            simulated decode step (first token).  SLA gating
+                            uses THIS value.
+The pipeline simulates time up to the first token in wall-clock terms; the
+remainder of decoding is accounted analytically only.
 
 Run modes
 ---------
@@ -41,35 +66,26 @@ import json
 import math
 import queue
 import random
-import socket
 import socketserver
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # ── project root on path ────────────────────────────────────────────────────
 _ROOT = Path(__file__).parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import amio_constants as _C
+
 from simulation.controller import (
     AdaptiveController,
     InferenceRequest,
     SystemState,
     ExecutionPlan,
-    STATIC_BUDGET_MB,
-    M3_TOTAL_MEMORY_MB,
-    SLA_TTFT_MS,
-    TBT_SLA_MS,
-    DECODE_OVERHEAD_MS,
-    DECODE_BW_COST_MS,
-    VISION_BASE_MS,
-    BASELINE_N_CROPS,
-    TOKENS_PER_CROP,
-    M3_TOTAL_SMS,
     KV_QUANT_BITS,
 )
 from simulation.parallelism_engine import ParallelismMode
@@ -77,20 +93,66 @@ from simulation.kv_manager import (
     ContiguousBackend,
     PagedBackend,
     KV_POOL_BUDGET_MB,
-    KV_BYTES_PER_TOKEN,
     kv_cache_size_mb,
 )
 from model_calibration.cost_model import CostModel
 
-# KV bytes per token at W4 (4-bit) quantization
-_KV_W4_BYTES = KV_BYTES_PER_TOKEN // 4   # = 27,648
+# ── Shared constants (single source of truth: amio_constants) ──────────────
+# MEASURED (baseline/results_v2.json, 2026-07-28): vision cost is linear in
+# crop count, decode TBT floor is ~18-25 ms (comfortably under the 80ms TBT
+# SLA); the binding, INFEASIBLE constraint is the 500ms TTFT SLA — measured
+# vision cost alone at 1 crop (~581 ms) already exceeds it.
+SLA_TTFT_MS        = _C.TTFT_SLA_MS               # 500 ms (infeasible on this HW)
+TBT_SLA_MS         = _C.TBT_SLA_MS                # 80 ms (comfortably met)
+DECODE_OVERHEAD_MS = _C.DECODE_OVERHEAD_MS_MEASURED   # 18.33 measured @ batch=1
+DECODE_KV_MS_PER_CTX_TOKEN = _C.DECODE_KV_MS_PER_CTX_TOKEN  # 0.00320 measured
+VISION_MS_PER_CROP = _C.VISION_MS_PER_CROP        # 553.5 measured, linear fit
+VISION_FIXED_MS    = _C.VISION_FIXED_MS           # 27.4 measured
+BASELINE_N_CROPS   = _C.MAX_CROPS                 # 17 (processor max; no "24")
+TOKENS_PER_CROP    = _C.TOKENS_PER_CROP           # 81 (from config.json)
+M3_TOTAL_SMS       = _C.TOTAL_COMPUTE_SHARES      # 38 modeled shares (not HW SMs)
+M3_TOTAL_MEMORY_MB = _C.TOTAL_MEMORY_MB           # 8192
 
-# Resolution → max crops mapping (Phase 3 SigLIP grid)
-_RESOLUTION_TO_CROPS: Dict[int, int] = {
-    224: 1, 336: 4, 448: 6, 512: 9, 756: 13, 1008: 21, 1512: 24,
-}
+# KV bytes per token at W4 (4-bit) quantization (modeled)
+_KV_W4_BYTES = _C.KV_BYTES_PER_TOKEN_W4           # 49,152
+
+
+def _predict_tbt_ms(ctx_tokens: int, batch: int) -> float:
+    """MEASURED batch=1 decode TBT + modeled batch-scaling term.
+
+    TBT(ctx, B) = DECODE_OVERHEAD_MS + DECODE_KV_MS_PER_CTX_TOKEN * ctx
+                  + (B - 1) * (ctx * KV_BYTES_PER_TOKEN_FP16 / BW_GBps / 1e6)
+
+    The last term (extra concurrent sequences' KV reads) is a modeling
+    assumption, not measured; batch=1 terms are direct measurements from
+    baseline/results_v2.json.
+    """
+    kv_read_ms_per_extra_seq = (
+        ctx_tokens * _C.KV_BYTES_PER_TOKEN_FP16 / (_C.M3_MEMORY_BW_GBPS * 1e6)
+    )
+    return (
+        DECODE_OVERHEAD_MS
+        + DECODE_KV_MS_PER_CTX_TOKEN * ctx_tokens
+        + max(0, batch - 1) * kv_read_ms_per_extra_seq
+    )
+
+# Resolution → max crops mapping — MEASURED processor settings (there is no
+# "24 crops" mode in this pipeline; see amio_constants.CROP_SETTINGS).
+_RESOLUTION_TO_CROPS: Dict[int, int] = dict(_C.CROP_SETTINGS)  # {384:1,768:5,1152:10,1536:17}
 
 _SENTINEL = object()   # sentinel for queue shutdown
+
+
+def _percentile(sorted_vals: List[float], q: float) -> float:
+    """Linear-interpolation percentile of an already-sorted list (q in 0..1)."""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = q * (len(sorted_vals) - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo)
 
 
 # ===========================================================================
@@ -99,7 +161,8 @@ _SENTINEL = object()   # sentinel for queue shutdown
 
 @dataclass
 class TelemetryRecord:
-    """Per-request telemetry record — written by the Collector thread."""
+    """Per-request telemetry record — all latencies SIMULATED, none measured
+    from a real model."""
     req_id: int
     image_resolution: int
     prompt_length: int
@@ -110,14 +173,16 @@ class TelemetryRecord:
     sm_decode: int
     is_fallback: bool
     predicted_ttft_ms: float
-    actual_ttft_ms: float
-    ttft_error_ms: float          # actual − predicted
-    actual_t_vision_ms: float
-    actual_t_prefill_ms: float
-    actual_t_migration_ms: float
-    actual_tbt_ms: float
+    simulated_stage_ttft_ms: float   # formula sum (vision+prefill+migration)
+    wall_ttft_ms: float              # wall clock submit → first token (SLA-gated)
+    ttft_error_ms: float             # simulated stage sum − predicted
+    simulated_t_vision_ms: float
+    simulated_t_prefill_ms: float
+    simulated_t_migration_ms: float
+    simulated_tbt_ms: float
+    tbt_sla_pass: bool
     kv_alloc_mb: float
-    sla_pass: bool
+    sla_pass: bool                   # gated on wall_ttft_ms
     quality_score: float
     timestamp_ms: float
 
@@ -126,7 +191,7 @@ class TelemetryRecord:
 class PipelineRequest:
     """
     Wraps an InferenceRequest with execution state, an attached ExecutionPlan,
-    and in-flight latency measurements.
+    and in-flight simulated latency values.
 
     The plan is attached at admission time by the SystemOrchestrator and
     propagated through Vision → Prefill → Decode without modification.
@@ -135,17 +200,21 @@ class PipelineRequest:
     system_state:  SystemState          # snapshot captured at admission
     plan:          Optional[ExecutionPlan] = None
 
-    # Actual latencies measured/simulated by each worker
-    actual_t_vision_ms:    float = 0.0
-    actual_t_prefill_ms:   float = 0.0
-    actual_t_migration_ms: float = 0.0
-    actual_ttft_ms:        float = 0.0
-    actual_tbt_ms:         float = 0.0
-    kv_alloc_mb:           float = 0.0
-    kv_seq_id:             int   = -1   # PagedBackend seq_id for free()
-    sla_pass:              bool  = False
+    # Simulated latencies produced by each worker (formula + noise)
+    simulated_t_vision_ms:    float = 0.0
+    simulated_t_prefill_ms:   float = 0.0
+    simulated_t_migration_ms: float = 0.0
+    simulated_stage_ttft_ms:  float = 0.0
+    wall_ttft_ms:             float = 0.0
+    simulated_tbt_ms:         float = 0.0
+    tbt_sla_pass:             bool  = False
+    kv_alloc_mb:              float = 0.0
+    kv_admitted_mb:           float = 0.0   # exact amount added to _kv_used_mb at admission
+    kv_seq_id:                int   = -1    # PagedBackend seq_id (from KVAllocationResult)
+    sla_pass:                 bool  = False
 
-    admission_time_ms: float = 0.0
+    admission_time_ms: float = 0.0          # epoch ms (telemetry timestamp)
+    submit_perf:       float = 0.0          # perf_counter at submit (for wall TTFT)
 
     # Completion signal — callers wait on this
     _done: threading.Event = field(
@@ -153,6 +222,8 @@ class PipelineRequest:
     )
 
     def wait(self, timeout_s: float = 30.0) -> bool:
+        """Wait for completion.  Returns False on timeout — callers MUST
+        check the result (the API layer returns HTTP 504 on timeout)."""
         return self._done.wait(timeout_s)
 
     def mark_done(self) -> None:
@@ -172,12 +243,14 @@ class PipelineRequest:
             sm_decode=p.sm_decode if p else 0,
             is_fallback=p.is_fallback if p else True,
             predicted_ttft_ms=p.predicted_ttft_ms if p else 0.0,
-            actual_ttft_ms=self.actual_ttft_ms,
-            ttft_error_ms=self.actual_ttft_ms - (p.predicted_ttft_ms if p else 0.0),
-            actual_t_vision_ms=self.actual_t_vision_ms,
-            actual_t_prefill_ms=self.actual_t_prefill_ms,
-            actual_t_migration_ms=self.actual_t_migration_ms,
-            actual_tbt_ms=self.actual_tbt_ms,
+            simulated_stage_ttft_ms=self.simulated_stage_ttft_ms,
+            wall_ttft_ms=self.wall_ttft_ms,
+            ttft_error_ms=self.simulated_stage_ttft_ms - (p.predicted_ttft_ms if p else 0.0),
+            simulated_t_vision_ms=self.simulated_t_vision_ms,
+            simulated_t_prefill_ms=self.simulated_t_prefill_ms,
+            simulated_t_migration_ms=self.simulated_t_migration_ms,
+            simulated_tbt_ms=self.simulated_tbt_ms,
+            tbt_sla_pass=self.tbt_sla_pass,
             kv_alloc_mb=self.kv_alloc_mb,
             sla_pass=self.sla_pass,
             quality_score=p.quality_score if p else 0.0,
@@ -186,23 +259,32 @@ class PipelineRequest:
 
 
 # ===========================================================================
-# Section 1 — Model Workers
+# Section 1 — Simulated Stage Workers
 # ===========================================================================
+#
+# Worker protocol (shared by all three stage workers):
+#   * Normal item : compute simulated latency, sleep it (so wall-clock time
+#     reflects modeled load), put downstream FIRST, then task_done().
+#     Put-before-task_done matters: shutdown() may join() a queue, and the
+#     old task_done-before-put ordering let a shutdown sentinel overtake an
+#     in-flight request, which then hung forever.
+#   * Sentinel    : forward the sentinel downstream (cascade), task_done(),
+#     exit.  The orchestrator injects a single sentinel into the FIRST queue
+#     only; FIFO ordering guarantees it drains behind all in-flight work.
 
 class VisionWorker(threading.Thread):
     """
-    Vision encoding worker.
+    SIMULATED vision-encoding worker (no encoder runs).
 
-    Reads from vision_q, applies the SM partition from the attached
-    ExecutionPlan using the Phase 3 compute-bound linear scaling model:
+    Reads from vision_q, applies the compute-share partition from the
+    attached ExecutionPlan using the MEASURED Phase 3 linear scaling model:
 
-        T_vision = (n_crops / 24) × V_BASE × (38 / sm_vision)
+        T_vision = (VISION_MS_PER_CROP × n_crops + VISION_FIXED_MS) × (38 / sm_vision)
 
-    When sm_vision == 38 (no concurrent decode), the formula reduces to the
-    baseline, yielding the minimum possible vision latency.
-
-    Coarse SM granularity: the SM partition is read once from the plan before
-    each forward pass — zero CPU synchronisation overhead during execution.
+    VISION_MS_PER_CROP/VISION_FIXED_MS are fit to baseline/results_v2.json
+    (direct stage-isolated measurement on the real M3 target, 5 trials x 4
+    crop settings) — see amio_constants. The worker sleeps the simulated
+    duration so downstream wall-clock timing includes this stage.
     """
 
     def __init__(
@@ -222,6 +304,7 @@ class VisionWorker(threading.Thread):
         while True:
             item = self._in.get()
             if item is _SENTINEL:
+                self._out.put(_SENTINEL)     # cascade shutdown downstream
                 self._in.task_done()
                 break
 
@@ -229,26 +312,27 @@ class VisionWorker(threading.Thread):
             plan = p.plan
             assert plan is not None, "Plan must be attached before VisionWorker"
 
-            # SM partition from plan (Nova allocation, computed at admission)
+            # Share partition from plan (Nova allocation, computed at admission)
             sm_vis = plan.sm_vision if plan.sm_vision > 0 else M3_TOTAL_SMS
 
-            # Compute-bound linear model (Phase 3 SMOrchestrator formula)
+            # Compute-bound linear model (Phase 3 SMOrchestrator formula, measured)
             t_vis = (
-                (plan.n_crops / BASELINE_N_CROPS)
-                * VISION_BASE_MS
+                (VISION_MS_PER_CROP * plan.n_crops + VISION_FIXED_MS)
                 * (M3_TOTAL_SMS / sm_vis)
             )
-            # Realistic Gaussian timing noise (±σ of predicted)
+            # Gaussian timing noise (±σ of predicted)
             t_vis *= max(0.5, 1.0 + self._rng.gauss(0.0, self._sigma))
-            p.actual_t_vision_ms = t_vis
+            p.simulated_t_vision_ms = t_vis
 
-            self._in.task_done()
+            time.sleep(t_vis / 1000.0)       # occupy simulated wall time
+
             self._out.put(p)
+            self._in.task_done()
 
 
 class PrefillWorker(threading.Thread):
     """
-    LM prefill worker implementing ParVTS (Parallel Vision Token Scheduling).
+    SIMULATED LM prefill worker implementing ParVTS scheduling (no LM runs).
 
     ParVTS logic (Phase 6.3):
       1. Both subject and non-subject token paths enter the LM together.
@@ -256,8 +340,11 @@ class PrefillWorker(threading.Thread):
          pruned (predict_migration_cost captures this overhead).
       3. Only n_effective_tokens continue through the remaining layers.
 
-    Latency model: Phase 2 quadratic cost model (R² = 0.9978).
-    Tensor-parallel mode applies a 25% simulated TP speedup.
+    Latency model: MEASURED Phase 2 quadratic cost model (fit to 4 real
+    stage-isolated points; see amio_constants). Single-chip TP is cost-
+    neutral — there is one GPU, so parallelism_mode never changes predicted
+    latency (the former 25% "TP" discount was a modeling fiction and has
+    been removed). The worker sleeps the simulated duration.
     """
 
     def __init__(
@@ -279,6 +366,7 @@ class PrefillWorker(threading.Thread):
         while True:
             item = self._in.get()
             if item is _SENTINEL:
+                self._out.put(_SENTINEL)     # cascade shutdown downstream
                 self._in.task_done()
                 break
 
@@ -286,10 +374,9 @@ class PrefillWorker(threading.Thread):
             plan = p.plan
             assert plan is not None
 
-            # LM prefill cost (Phase 2 CostModel)
+            # LM prefill cost (measured Phase 2 CostModel). Single-chip TP is
+            # cost-neutral (there is one GPU) — no parallelism-mode discount.
             t_pref = self._cm.predict_t_lm_prefill(plan.n_lm_tokens)
-            if plan.parallelism_mode == ParallelismMode.TP:
-                t_pref *= 0.75
 
             # ParVTS migration overhead
             t_mig = 0.0
@@ -302,22 +389,35 @@ class PrefillWorker(threading.Thread):
 
             noise_p = max(0.5, 1.0 + self._rng.gauss(0.0, self._sigma))
             noise_m = max(0.5, 1.0 + self._rng.gauss(0.0, self._sigma))
-            p.actual_t_prefill_ms   = t_pref * noise_p
-            p.actual_t_migration_ms = t_mig  * noise_m
+            p.simulated_t_prefill_ms   = t_pref * noise_p
+            p.simulated_t_migration_ms = t_mig  * noise_m
 
-            self._in.task_done()
+            time.sleep((p.simulated_t_prefill_ms + p.simulated_t_migration_ms) / 1000.0)
+
             self._out.put(p)
+            self._in.task_done()
 
 
 class DecodeWorker(threading.Thread):
     """
-    Auto-regressive decode worker with PagedAttention KV management.
+    SIMULATED auto-regressive decode worker with PagedAttention KV
+    bookkeeping (no decoding runs).
 
     On-demand KV page allocation: blocks are assigned only when a sequence
     enters the decode stage — no pre-allocation at request admission.
 
-    TBT model (Phase 5): TBT(B) = DECODE_OVERHEAD + DECODE_BW_COST × B
+    TBT model (Phase 5, UNVALIDATED constants):
+        TBT(B) = DECODE_OVERHEAD + DECODE_BW_COST × B
     where B is the effective batch size including this new request.
+
+    The worker sleeps ONE simulated TBT (the first decode step) so that
+    wall-clock TTFT includes it; the remaining generation is accounted
+    analytically only (sleeping the full generation would take minutes at
+    benchmark scale).
+
+    Exception contract: PagedBackend.allocate raises ``MemoryError`` on pool
+    exhaustion — that is what this worker catches.  (A previous version
+    caught RuntimeError, which killed the thread and wedged the pipeline.)
     """
 
     def __init__(
@@ -327,6 +427,7 @@ class DecodeWorker(threading.Thread):
         kv_backend: PagedBackend,
         noise_sigma: float = 0.03,
         daemon:      bool  = True,
+        on_decode_start: Optional[Callable[[], None]] = None,
     ):
         super().__init__(daemon=daemon, name="DecodeWorker")
         self._in    = in_q
@@ -334,8 +435,7 @@ class DecodeWorker(threading.Thread):
         self._kv    = kv_backend
         self._rng   = random.Random(44)
         self._sigma = noise_sigma
-        # Mirrors PagedBackend._next_seq_id for safe seq_id tracking
-        self._next_seq_id: int = 0
+        self._on_decode_start = on_decode_start
         self._batch_size:  int = 0
         self._batch_lock = threading.Lock()
 
@@ -347,6 +447,7 @@ class DecodeWorker(threading.Thread):
         while True:
             item = self._in.get()
             if item is _SENTINEL:
+                self._out.put(_SENTINEL)     # cascade shutdown to collector
                 self._in.task_done()
                 break
 
@@ -354,39 +455,47 @@ class DecodeWorker(threading.Thread):
             plan = p.plan
             assert plan is not None
 
+            # Mark this request as decoding (orchestrator counter — the
+            # matching decrement happens in the Collector).
+            if self._on_decode_start is not None:
+                self._on_decode_start()
+
             # On-demand KV page allocation (Phase 4 PagedBackend)
             seq_len = plan.n_lm_tokens + p.request.max_output_tokens
             try:
                 alloc = self._kv.allocate(seq_len)
-                seq_id = self._next_seq_id
-                self._next_seq_id += 1
-                p.kv_seq_id  = seq_id
+                p.kv_seq_id   = alloc.seq_id     # backend-assigned id
                 p.kv_alloc_mb = alloc.kv_used_mb
-            except RuntimeError:
-                # Pool exhausted: estimate without storing
+            except (MemoryError, RuntimeError):
+                # Pool exhausted: estimate without storing.  allocate() is
+                # transactional, so nothing leaked.
                 p.kv_alloc_mb = kv_cache_size_mb(seq_len, quantization_bits=KV_QUANT_BITS)
-                seq_id = -1
+                p.kv_seq_id   = -1
 
-            # TBT with batch awareness
+            # TBT with batch awareness (note: single serial worker → the
+            # instantaneous batch here is nearly always 1)
             with self._batch_lock:
                 self._batch_size += 1
                 batch = self._batch_size
 
-            tbt = DECODE_OVERHEAD_MS + DECODE_BW_COST_MS * batch
-            p.actual_tbt_ms = tbt * max(0.5, 1.0 + self._rng.gauss(0.0, self._sigma))
+            tbt = _predict_tbt_ms(seq_len, batch)
+            p.simulated_tbt_ms = tbt * max(0.5, 1.0 + self._rng.gauss(0.0, self._sigma))
 
-            # Release KV pages after decode completes
+            # Sleep one simulated decode step (first token) — wall TTFT
+            # therefore includes the first decode step.
+            time.sleep(p.simulated_tbt_ms / 1000.0)
+
             with self._batch_lock:
                 self._batch_size = max(0, self._batch_size - 1)
 
-            if seq_id >= 0:
+            if p.kv_seq_id >= 0:
                 try:
-                    self._kv.free(seq_id)
+                    self._kv.free(p.kv_seq_id)
                 except Exception:
                     pass
 
-            self._in.task_done()
             self._out.put(p)
+            self._in.task_done()
 
 
 # ===========================================================================
@@ -395,7 +504,8 @@ class DecodeWorker(threading.Thread):
 
 class SystemOrchestrator:
     """
-    Centralized event loop implementing the Nova architectural pattern.
+    Centralized event loop implementing the Nova architectural pattern —
+    over SIMULATED stage workers (no model is loaded).
 
     Pipeline topology
     -----------------
@@ -404,23 +514,24 @@ class SystemOrchestrator:
                                     → [decode_q] → DecodeWorker
                                                  → [done_q] → Collector
 
+    Four threads total: VisionWorker, PrefillWorker, DecodeWorker, Collector.
+    The stage queues are standard blocking queues (get() blocks).
+
     State propagation
     -----------------
-    The ExecutionPlan generated by Phase 6 AdaptiveController is attached to
-    every PipelineRequest at admission and propagated verbatim through all
+    The ExecutionPlan generated by the Phase 6 AdaptiveController is attached
+    to every PipelineRequest at admission and propagated verbatim through all
     stages — workers read the plan but never mutate it.
-
-    SM coarse granularity
-    ---------------------
-    SM partitioning is computed once at admission time by the Nova heuristic
-    and embedded in the plan.  Each worker reads `plan.sm_vision` exactly once
-    before its forward pass, eliminating repeated CPU-side synchronisation.
 
     Resource synchronisation
     ------------------------
-    A single shared lock protects the live counters (n_pending, n_decoding,
-    kv_used_mb).  The Collector thread updates these counters for every
-    completed request.
+    A single shared lock (_lock) protects the live counters (n_pending,
+    n_decoding, kv_used_mb).  n_decoding is incremented when the DecodeWorker
+    picks a request up (on_decode_start callback) and decremented by the
+    Collector — so the controller's SystemState snapshot actually sees decode
+    occupancy.  kv_used_mb is incremented by the plan's predicted KV at
+    admission and decremented by exactly that same amount at completion
+    (stored on the request), so the counter cannot drift.
     """
 
     def __init__(
@@ -444,7 +555,7 @@ class SystemOrchestrator:
             pool_budget_mb=KV_POOL_BUDGET_MB,
         )
 
-        # Pipeline queues (thread-safe, non-blocking)
+        # Pipeline queues (thread-safe; get() blocks until an item arrives)
         self._vision_q  = queue.Queue()
         self._prefill_q = queue.Queue()
         self._decode_q  = queue.Queue()
@@ -455,47 +566,48 @@ class SystemOrchestrator:
         self._n_pending:  int   = 0
         self._n_decoding: int   = 0
         self._kv_used_mb: float = 0.0
+        self._n_tbt_violations: int = 0
 
         # Telemetry log
         self._telemetry: List[TelemetryRecord] = []
         self._tel_lock = threading.Lock()
 
-        # Model workers
+        # Simulated stage workers (four threads incl. Collector)
         self._vision_w  = VisionWorker(self._vision_q,  self._prefill_q, noise_sigma=0.03)
         self._prefill_w = PrefillWorker(self._prefill_q, self._decode_q,  self._cost_model)
-        self._decode_w  = DecodeWorker(self._decode_q,  self._done_q,    self._kv_backend)
+        self._decode_w  = DecodeWorker(
+            self._decode_q, self._done_q, self._kv_backend,
+            on_decode_start=self._incr_decoding,
+        )
         self._collector = threading.Thread(
             target=self._collect_done, daemon=True, name="Collector"
         )
 
+        self._start_lock = threading.Lock()
         self._started  = False
         self._shutdown = False
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if self._started:
-            return
-        self._vision_w.start()
-        self._prefill_w.start()
-        self._decode_w.start()
-        self._collector.start()
-        self._started = True
+        with self._start_lock:
+            if self._started:
+                return
+            self._vision_w.start()
+            self._prefill_w.start()
+            self._decode_w.start()
+            self._collector.start()
+            self._started = True
 
     def shutdown(self, drain_timeout_s: float = 10.0) -> None:
         if not self._started or self._shutdown:
             return
 
-        # Wait for queues to drain, then send shutdown sentinels
-        try:
-            self._vision_q.join()
-            self._prefill_q.join()
-            self._decode_q.join()
-        except Exception:
-            pass
-
-        for q in (self._vision_q, self._prefill_q, self._decode_q, self._done_q):
-            q.put(_SENTINEL)
+        # A single sentinel is injected into the FIRST queue only; each
+        # worker forwards it downstream after finishing all items queued
+        # ahead of it (FIFO), so the sentinel can never overtake in-flight
+        # work.  Workers put-then-task_done, so join() is also safe.
+        self._vision_q.put(_SENTINEL)
 
         for w in (self._vision_w, self._prefill_w, self._decode_w, self._collector):
             w.join(timeout=drain_timeout_s)
@@ -515,7 +627,7 @@ class SystemOrchestrator:
           4. Enqueue in Vision stage.
         """
         if not self._started:
-            self.start()
+            self.start()    # start() is internally locked (no double-start race)
 
         state = self._snapshot_state()
         plan  = self._controller.optimize(request, state)
@@ -525,11 +637,16 @@ class SystemOrchestrator:
             system_state=state,
             plan=plan,
             admission_time_ms=time.time() * 1000,
+            submit_perf=time.perf_counter(),
         )
+        # Remember exactly how much we add to the KV counter so completion
+        # can subtract the identical amount (predicted-vs-actual unit mixing
+        # previously made the counter drift monotonically).
+        p.kv_admitted_mb = plan.predicted_kv_seq_mb
 
         with self._lock:
             self._n_pending  += 1
-            self._kv_used_mb += plan.predicted_kv_seq_mb
+            self._kv_used_mb += p.kv_admitted_mb
 
         self._vision_q.put(p)
         return p
@@ -544,27 +661,38 @@ class SystemOrchestrator:
         if not recs:
             print("  No telemetry records.")
             return
-        n         = len(recs)
-        n_pass    = sum(1 for r in recs if r.sla_pass)
-        ttfts     = sorted(r.actual_ttft_ms for r in recs)
-        errors    = [abs(r.ttft_error_ms)   for r in recs]
-        avg_ttft  = sum(ttfts) / n
-        p50       = ttfts[int(0.50 * n)]
-        p99       = ttfts[min(int(0.99 * n), n - 1)]
-        avg_err   = sum(errors) / n
-        avg_crops = sum(r.n_crops for r in recs) / n
-        avg_qual  = sum(r.quality_score for r in recs) / n
-        n_fb      = sum(1 for r in recs if r.is_fallback)
-        print(f"  Requests processed  : {n}")
-        print(f"  SLA pass rate       : {100*n_pass/n:.1f}%")
-        print(f"  Avg actual TTFT     : {avg_ttft:.1f} ms")
-        print(f"  P50 / P99 TTFT      : {p50:.1f} / {p99:.1f} ms")
-        print(f"  Avg prediction error: {avg_err:.1f} ms")
+        n          = len(recs)
+        n_pass     = sum(1 for r in recs if r.sla_pass)
+        n_tbt_viol = sum(1 for r in recs if not r.tbt_sla_pass)
+        sim_ttfts  = sorted(r.simulated_stage_ttft_ms for r in recs)
+        wall_ttfts = sorted(r.wall_ttft_ms for r in recs)
+        errors     = [abs(r.ttft_error_ms) for r in recs]
+        avg_sim    = sum(sim_ttfts) / n
+        avg_wall   = sum(wall_ttfts) / n
+        avg_err    = sum(errors) / n
+        avg_crops  = sum(r.n_crops for r in recs) / n
+        avg_qual   = sum(r.quality_score for r in recs) / n
+        n_fb       = sum(1 for r in recs if r.is_fallback)
+        print(f"  Requests processed  : {n}   (ALL LATENCIES SIMULATED — no model)")
+        print(f"  SLA pass rate       : {100*n_pass/n:.1f}%  (gated on wall TTFT incl. queue wait)")
+        print(f"  Avg simulated TTFT  : {avg_sim:.1f} ms  (stage-formula sum)")
+        print(f"  Avg wall TTFT       : {avg_wall:.1f} ms  (submit → first token)")
+        print(f"  P50 / P99 wall TTFT : {_percentile(wall_ttfts, 0.50):.1f} / "
+              f"{_percentile(wall_ttfts, 0.99):.1f} ms")
+        print(f"  Avg prediction error: {avg_err:.1f} ms  (|sim − predicted|)")
+        print(f"  TBT SLA violations  : {n_tbt_viol}/{n}  "
+              f"(measured batch=1 TBT floor ~{DECODE_OVERHEAD_MS:.1f} ms vs "
+              f"{TBT_SLA_MS:.0f} ms target)")
         print(f"  Avg crops selected  : {avg_crops:.2f}")
-        print(f"  Avg quality score   : {avg_qual:.3f}")
+        print(f"  Avg quality score   : {avg_qual:.3f}  (crop×keep input proxy, not accuracy)")
         print(f"  Fallbacks           : {n_fb} ({100*n_fb/n:.1f}%)")
 
     # ── Internal ─────────────────────────────────────────────────────────────
+
+    def _incr_decoding(self) -> None:
+        """Called by DecodeWorker when a request enters the decode stage."""
+        with self._lock:
+            self._n_decoding += 1
 
     def _snapshot_state(self) -> SystemState:
         with self._lock:
@@ -577,7 +705,8 @@ class SystemOrchestrator:
             )
 
     def _collect_done(self) -> None:
-        """Collect finished PipelineRequests, compute TTFT, log telemetry."""
+        """Collect finished PipelineRequests, compute TTFT (both definitions),
+        validate SLAs, log telemetry."""
         while True:
             item = self._done_q.get()
             if item is _SENTINEL:
@@ -586,18 +715,27 @@ class SystemOrchestrator:
 
             p: PipelineRequest = item
 
-            # TTFT = sum of the three stages
-            p.actual_ttft_ms = (
-                p.actual_t_vision_ms
-                + p.actual_t_prefill_ms
-                + p.actual_t_migration_ms
+            # Simulated stage TTFT = formula sum (excludes queue wait + first
+            # decode step); wall TTFT = wall time since submit (queue wait +
+            # slept stage durations + first decode step).  SLA gates on WALL.
+            p.simulated_stage_ttft_ms = (
+                p.simulated_t_vision_ms
+                + p.simulated_t_prefill_ms
+                + p.simulated_t_migration_ms
             )
-            p.sla_pass = p.actual_ttft_ms <= self.sla_budget_ms
+            p.wall_ttft_ms = (time.perf_counter() - p.submit_perf) * 1000.0
+            p.sla_pass     = p.wall_ttft_ms <= self.sla_budget_ms
+
+            # TBT SLA validation (previously never checked)
+            p.tbt_sla_pass = p.simulated_tbt_ms <= TBT_SLA_MS
 
             with self._lock:
                 self._n_pending  = max(0, self._n_pending - 1)
                 self._n_decoding = max(0, self._n_decoding - 1)
-                self._kv_used_mb = max(0.0, self._kv_used_mb - p.kv_alloc_mb)
+                # Subtract exactly what admission added (no unit mixing)
+                self._kv_used_mb = max(0.0, self._kv_used_mb - p.kv_admitted_mb)
+                if not p.tbt_sla_pass:
+                    self._n_tbt_violations += 1
 
             if self.log_telemetry:
                 rec = p.telemetry
@@ -609,17 +747,18 @@ class SystemOrchestrator:
 
 
 # ===========================================================================
-# Section 2 — OpenAI-Compatible API Layer
+# Section 2 — OpenAI-Format API Layer (SIMULATION — placeholder responses)
 # ===========================================================================
 
 class _ChatHandler(http.server.BaseHTTPRequestHandler):
     """
     HTTP handler for POST /v1/multimodal/chat/completions.
 
-    Follows the OpenAI Chat Completions format.  Internally calls
-    SystemOrchestrator.submit() → waits for completion → returns:
-      - Standard JSON response body with `usage._amio_telemetry` field.
-      - X-AMIO-* response headers for low-latency telemetry scraping.
+    Follows the OpenAI Chat Completions response SHAPE, but the content is a
+    simulation placeholder: no model is loaded, no tokens are generated, and
+    all telemetry values are cost-model formula evaluations.  The response
+    carries `"simulated": true` markers and X-AMIO-Simulated-* headers so it
+    cannot be mistaken for real inference output.
     """
 
     # Set by make_api_server() via class-level injection
@@ -660,55 +799,66 @@ class _ChatHandler(http.server.BaseHTTPRequestHandler):
             arrival_time_ms=time.time() * 1000,
         )
 
-        # ── Submit and wait ──────────────────────────────────────────────
-        t_admit = time.perf_counter()
-        pr      = self.orchestrator.submit(req)
-        pr.wait(timeout_s=60.0)
-        wall_ttft_ms = (time.perf_counter() - t_admit) * 1000
+        # ── Submit and wait (timeout → HTTP 504, not a fake 200) ─────────
+        pr = self.orchestrator.submit(req)
+        if not pr.wait(timeout_s=60.0):
+            self._json_error(
+                504,
+                f"request {req_id} timed out in the simulation pipeline "
+                f"(60 s) — no result available",
+            )
+            return
 
         plan = pr.plan
 
-        # ── Build OpenAI-format response ─────────────────────────────────
+        # ── Build OpenAI-format response (SIMULATION PLACEHOLDER) ────────
         content = (
-            f"[AMIO] req={req_id}  crops={plan.n_crops}  "
+            f"[SIMULATION PLACEHOLDER — no model is loaded, no text was "
+            f"generated] req={req_id}  crops={plan.n_crops}  "
             f"keep={plan.token_keep_ratio:.2f}  "
-            f"TTFT={pr.actual_ttft_ms:.1f}ms  "
+            f"simulated_TTFT={pr.simulated_stage_ttft_ms:.1f}ms  "
+            f"wall_TTFT={pr.wall_ttft_ms:.1f}ms  "
             f"SLA={'PASS' if pr.sla_pass else 'FAIL'}"
         )
         sm_ratio = plan.sm_vision / M3_TOTAL_SMS
 
         amio_tel = {
-            "req_id":                req_id,
-            "n_crops":               plan.n_crops,
-            "token_keep_ratio":      round(plan.token_keep_ratio, 4),
-            "parallelism_mode":      plan.parallelism_mode.value,
-            "sm_partition":          f"{plan.sm_vision}/{plan.sm_decode}",
-            "sm_vision_ratio":       round(sm_ratio, 4),
-            "is_fallback":           plan.is_fallback,
-            "quality_score":         round(plan.quality_score, 4),
-            "predicted_ttft_ms":     round(plan.predicted_ttft_ms, 2),
-            "actual_ttft_ms":        round(pr.actual_ttft_ms, 2),
-            "wall_ttft_ms":          round(wall_ttft_ms, 2),
-            "ttft_prediction_error": round(pr.actual_ttft_ms - plan.predicted_ttft_ms, 2),
-            "sla_pass":              pr.sla_pass,
-            "kv_alloc_mb":           round(pr.kv_alloc_mb, 3),
-            "actual_tbt_ms":         round(pr.actual_tbt_ms, 2),
+            "simulated":               True,   # nothing here is measured from a model
+            "req_id":                  req_id,
+            "n_crops":                 plan.n_crops,
+            "token_keep_ratio":        round(plan.token_keep_ratio, 4),
+            "parallelism_mode":        plan.parallelism_mode.value,
+            "sm_partition":            f"{plan.sm_vision}/{plan.sm_decode}",
+            "sm_vision_ratio":         round(sm_ratio, 4),
+            "is_fallback":             plan.is_fallback,
+            "quality_score":           round(plan.quality_score, 4),
+            "predicted_ttft_ms":       round(plan.predicted_ttft_ms, 2),
+            "simulated_stage_ttft_ms": round(pr.simulated_stage_ttft_ms, 2),
+            "wall_ttft_ms":            round(pr.wall_ttft_ms, 2),
+            "ttft_prediction_error":   round(pr.simulated_stage_ttft_ms - plan.predicted_ttft_ms, 2),
+            "sla_pass":                pr.sla_pass,   # gated on wall TTFT
+            "kv_alloc_mb":             round(pr.kv_alloc_mb, 3),
+            "simulated_tbt_ms":        round(pr.simulated_tbt_ms, 2),
+            "tbt_sla_pass":            pr.tbt_sla_pass,
         }
 
+        # Token counts derived from the SIMULATED plan (planned LM input
+        # tokens and the requested completion budget) — no tokenizer ran.
         response = {
             "id":      f"amio-cmpl-{req_id}",
             "object":  "chat.completion",
             "created": int(time.time()),
-            "model":   "SmolVLM-Instruct-4bit-AMIO",
+            "model":   "SmolVLM-Instruct-4bit-AMIO-simulated",
             "choices": [{
                 "index": 0,
                 "message":       {"role": "assistant", "content": content},
                 "finish_reason": "stop",
             }],
             "usage": {
-                "prompt_tokens":     prompt_length,
-                "completion_tokens": max_output_tokens,
-                "total_tokens":      prompt_length + max_output_tokens,
+                "simulated":         True,
+                "prompt_tokens":     plan.n_lm_tokens,        # planned, not tokenized
+                "completion_tokens": max_output_tokens,       # requested budget
+                "total_tokens":      plan.n_lm_tokens + max_output_tokens,
                 "_amio_telemetry":   amio_tel,
             },
         }
@@ -718,12 +868,14 @@ class _ChatHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body_bytes)))
-        # Telemetry response headers for low-latency scraping
-        self.send_header("X-AMIO-N-Crops",            str(plan.n_crops))
+        # Telemetry response headers for low-latency scraping (all simulated)
+        self.send_header("X-AMIO-Simulated",           "true")
+        self.send_header("X-AMIO-N-Crops",             str(plan.n_crops))
         self.send_header("X-AMIO-SM-Partition",        f"{plan.sm_vision}/{plan.sm_decode}")
         self.send_header("X-AMIO-SM-Vision-Ratio",     f"{sm_ratio:.4f}")
         self.send_header("X-AMIO-Predicted-TTFT-MS",   f"{plan.predicted_ttft_ms:.2f}")
-        self.send_header("X-AMIO-Actual-TTFT-MS",      f"{pr.actual_ttft_ms:.2f}")
+        self.send_header("X-AMIO-Simulated-TTFT-MS",   f"{pr.simulated_stage_ttft_ms:.2f}")
+        self.send_header("X-AMIO-Wall-TTFT-MS",        f"{pr.wall_ttft_ms:.2f}")
         self.send_header("X-AMIO-SLA-Pass",            "true" if pr.sla_pass else "false")
         self.send_header("X-AMIO-Quality-Score",       f"{plan.quality_score:.4f}")
         self.send_header("X-AMIO-Is-Fallback",         "true" if plan.is_fallback else "false")
@@ -731,7 +883,7 @@ class _ChatHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
     def _json_error(self, code: int, message: str) -> None:
-        body = json.dumps({"error": message}).encode()
+        body = json.dumps({"error": message, "simulated": True}).encode()
         self.send_response(code)
         self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -761,12 +913,14 @@ def make_api_server(
 
 
 def run_api_server(host: str = "127.0.0.1", port: int = 8080) -> None:
-    """Start the AMIO API server; blocks until Ctrl+C."""
+    """Start the AMIO simulation API server; blocks until Ctrl+C."""
     orch = SystemOrchestrator(log_telemetry=True)
     orch.start()
     server = make_api_server(orch, host, port)
     url = f"http://{host}:{port}/v1/multimodal/chat/completions"
-    print(f"AMIO API server  →  POST {url}")
+    print("AMIO SIMULATION service — no model is loaded; all latencies are")
+    print("analytic cost-model formulas + noise. Responses are placeholders.")
+    print(f"API server  →  POST {url}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
@@ -785,15 +939,15 @@ def run_api_server(host: str = "127.0.0.1", port: int = 8080) -> None:
 
 def _demo_orchestrator_pipeline() -> None:
     """
-    Demonstrate the SystemOrchestrator end-to-end with 10 sample requests.  
-    Workers run in daemon threads; we wait for each request to complete and
-    then print per-request telemetry.
+    Demonstrate the SystemOrchestrator end-to-end with 10 sample requests.
+    Workers run in daemon threads and sleep their simulated stage durations;
+    we wait for each request to complete and then print per-request telemetry.
     """
     print()
     print("=" * 74)
-    print("  Phase 7 — System Orchestrator Pipeline Demo")
+    print("  Phase 7 — System Orchestrator Pipeline Demo  (SIMULATED — no model)")
     print("=" * 74)
-    print("  Starting workers: VisionWorker | PrefillWorker | DecodeWorker")
+    print("  Starting workers: VisionWorker | PrefillWorker | DecodeWorker | Collector")
 
     orch = SystemOrchestrator(log_telemetry=True)
     orch.start()
@@ -812,12 +966,12 @@ def _demo_orchestrator_pipeline() -> None:
     pipeline_reqs = [orch.submit(req) for req in requests]
 
     for pr in pipeline_reqs:
-        pr.wait(timeout_s=30.0)
+        pr.wait(timeout_s=60.0)
 
     hdr = (
         f"  {'ID':>3}  {'Res':>5}  {'Crops':>5}  {'Keep%':>6}  "
         f"{'Mode':<5}  {'SM v/d':>6}  {'T_vis':>7}  {'T_pre':>7}  "
-        f"{'T_mig':>7}  {'TTFT':>7}  {'SLA':>5}  {'Quality':>8}"
+        f"{'T_mig':>7}  {'SimTTFT':>8}  {'WallTTFT':>9}  {'SLA':>5}  {'Quality':>8}"
     )
     print(hdr)
     print("  " + "─" * (len(hdr) - 2))
@@ -830,8 +984,9 @@ def _demo_orchestrator_pipeline() -> None:
             f"{p.n_crops:>5}  {p.token_keep_ratio*100:>5.1f}%  "
             f"{p.parallelism_mode.value[:4]:<5}  "
             f"{p.sm_vision}/{p.sm_decode}  "
-            f"{pr.actual_t_vision_ms:>7.1f}  {pr.actual_t_prefill_ms:>7.1f}  "
-            f"{pr.actual_t_migration_ms:>7.1f}  {pr.actual_ttft_ms:>7.1f}  "
+            f"{pr.simulated_t_vision_ms:>7.1f}  {pr.simulated_t_prefill_ms:>7.1f}  "
+            f"{pr.simulated_t_migration_ms:>7.1f}  {pr.simulated_stage_ttft_ms:>8.1f}  "
+            f"{pr.wall_ttft_ms:>9.1f}  "
             f"{'PASS' if pr.sla_pass else 'FAIL':>5}  {p.quality_score:>8.3f}"
         )
 
@@ -862,12 +1017,13 @@ class BenchmarkResult:
     sla_budget_ms: float
     n_requests:    int
     sla_pass_rate: float       # fraction 0–1
-    avg_ttft_ms:   float
+    avg_ttft_ms:   float       # simulated (formula) TTFT
     p99_ttft_ms:   float
-    avg_quality:   float
-    avg_frag_pct:  float       # KV fragmentation
-    throughput:    float       # req/s (wall-clock estimate)
+    avg_quality:   float       # crop×keep input proxy — NOT accuracy
+    avg_frag_pct:  float       # per-allocation KV waste (successful allocs only)
+    throughput:    float       # ACHIEVED req/s from simulated completion times
     n_fallbacks:   int
+    n_kv_alloc_failures: int = 0   # KV pool exhaustion events (no fabricated frag)
 
 
 def _simulate_system(
@@ -880,16 +1036,25 @@ def _simulate_system(
     Simulate one system variant (Static Baseline / Greedy Fast / AMIO Adaptive)
     across a synthetic request stream.
 
-    All three systems use the same Phase 2 cost model for latency predictions.
-    They differ in:
-      - Crop selection strategy
-      - SM management heuristic
-      - Token pruning (ParVTS)
-      - KV allocation backend (paged vs contiguous)
+    HONESTY NOTE: all three systems are graded with the same Phase 2 cost
+    model that the AMIO controller optimizes against, plus 3% noise — this is
+    a model-vs-model comparison (the controller is evaluated by the simulator
+    it was built to satisfy), not an external measurement.
+
+    Decode overlap is modeled from arrival times: each request occupies the
+    decode stage from (arrival + TTFT) until (arrival + TTFT + 60×TBT), and
+    n_decoding at any admission is the number of requests still inside that
+    window.  KV allocations are freed when their request finishes; if the
+    pool still exhausts, the failure is COUNTED (n_kv_alloc_failures) rather
+    than replaced with a hardcoded fragmentation number.
+
+    Throughput is ACHIEVED throughput: n / (last simulated completion − first
+    arrival), not offered load.
 
     Returns aggregate BenchmarkResult.
     """
     noise = 0.03
+    max_out = 60   # output token budget per request
 
     # Per-system initialisation
     if system_name == "AMIO Adaptive":
@@ -907,26 +1072,40 @@ def _simulate_system(
     ttfts:      List[float] = []
     qualities:  List[float] = []
     frags:      List[float] = []
-    kv_mbs:     List[float] = []
-    n_sla_pass: int         = 0
-    n_fallbacks: int        = 0
-    n_decoding:  int        = 0
-    # Mirrors PagedBackend internal seq_id counter for free()
-    paged_seq_id: int       = 0
+    n_sla_pass:  int = 0
+    n_fallbacks: int = 0
+    n_kv_fail:   int = 0
+    # In-flight requests: (decode_start_ms, finish_ms, kv_seq_id, kv_mb)
+    in_flight: List[Tuple[float, float, int, float]] = []
+    completion_times: List[float] = []
 
     for i, (resolution, prompt_len, arrival_ms) in enumerate(reqs_data):
+        # ── Retire requests that finished before this arrival; free their KV
+        still_live: List[Tuple[float, float, int, float]] = []
+        for dec_start, finish, seq_id, kv_live in in_flight:
+            if finish <= arrival_ms:
+                if seq_id >= 0:
+                    kv_backend.free(seq_id)
+            else:
+                still_live.append((dec_start, finish, seq_id, kv_live))
+        in_flight = still_live
+
+        # Actual overlap given arrival times (not a monotonic counter)
+        n_decoding = sum(1 for ds, _, _, _ in in_flight if ds <= arrival_ms)
+        n_front    = len(in_flight) - n_decoding   # admitted, still pre-decode
+        kv_used_now = sum(k for _, _, _, k in in_flight)
+
         req = InferenceRequest(
             req_id=i,
             image_resolution=resolution,
             prompt_length=prompt_len,
-            max_output_tokens=60,
+            max_output_tokens=max_out,
             arrival_time_ms=arrival_ms,
         )
-        n_pending = max(0, len(reqs_data) - i - 1)
         state = SystemState(
-            n_pending_requests=n_pending,
+            n_pending_requests=n_front,
             n_decoding_requests=n_decoding,
-            kv_used_mb=sum(kv_mbs[-5:]) if kv_mbs else 0.0,
+            kv_used_mb=kv_used_now,
             current_decode_batch=max(1, n_decoding),
         )
 
@@ -964,21 +1143,21 @@ def _simulate_system(
             mig_depth  = 3
             quality    = 1 * 0.111
 
-        # ── Vision latency ───────────────────────────────────────────────
+        # ── Vision latency (simulated, MEASURED linear model) ────────────
         sm_eff = max(sm_vis, 1)
-        t_vis  = (n_crops / BASELINE_N_CROPS) * VISION_BASE_MS * (M3_TOTAL_SMS / sm_eff)
+        t_vis  = (VISION_MS_PER_CROP * n_crops + VISION_FIXED_MS) * (M3_TOTAL_SMS / sm_eff)
         t_vis *= max(0.5, 1.0 + rng.gauss(0.0, noise))
 
-        # ── LM prefill ───────────────────────────────────────────────────
+        # ── LM prefill (simulated) ───────────────────────────────────────
         n_vis = max(1, round(n_crops * TOKENS_PER_CROP))
         n_eff = max(1, round(n_vis * keep_ratio))
         n_lm  = n_eff + prompt_len
         t_pre = cm.predict_t_lm_prefill(n_lm)
-        if mode == ParallelismMode.TP:
-            t_pre *= 0.75
+        # NOTE: single-chip TP is cost-neutral (there is one GPU) — no
+        # parallelism-mode discount is applied, matching simulation/controller.py.
         t_pre *= max(0.5, 1.0 + rng.gauss(0.0, noise))
 
-        # ── ParVTS migration cost ─────────────────────────────────────────
+        # ── ParVTS migration cost (simulated) ────────────────────────────
         t_mig = 0.0
         if use_parvts and keep_ratio < 1.0:
             t_mig = cm.predict_migration_cost(n_vis, n_eff, mig_depth)
@@ -986,41 +1165,37 @@ def _simulate_system(
 
         ttft = t_vis + t_pre + t_mig
 
-        # ── KV allocation ────────────────────────────────────────────────
-        seq_len = n_lm + 60
-        frag    = 0.0
-        kv_mb   = 0.0
-        try:
-            alloc = kv_backend.allocate(min(seq_len, 2048))
-            kv_mb = alloc.kv_used_mb
-            frag  = alloc.fragmentation_pct
+        # ── Decode duration (analytic) and completion time ───────────────
+        tbt = _predict_tbt_ms(n_lm + max_out, n_decoding + 1)
+        finish_ms = arrival_ms + ttft + tbt * max_out
+        completion_times.append(finish_ms)
 
-            # Free paged allocations to keep pool healthy
-            if system_name == "AMIO Adaptive":
-                try:
-                    kv_backend.free(paged_seq_id)   # type: ignore[union-attr]
-                    paged_seq_id += 1
-                except Exception:
-                    pass
-        except (RuntimeError, AssertionError):
-            # Pool full or seq len exceeded max — use analytical estimate
+        # ── KV allocation (pool state reflects live sequences) ───────────
+        seq_len = n_lm + max_out
+        kv_mb   = 0.0
+        seq_id  = -1
+        try:
+            alloc  = kv_backend.allocate(min(seq_len, 2048))
+            kv_mb  = alloc.kv_used_mb
+            seq_id = alloc.seq_id
+            frags.append(alloc.fragmentation_pct)
+        except MemoryError:
+            # Pool genuinely exhausted even after retiring finished requests:
+            # count the failure honestly — no hardcoded fragmentation value.
+            n_kv_fail += 1
             kv_mb = kv_cache_size_mb(seq_len, quantization_bits=KV_QUANT_BITS)
-            frag  = 1.5 if system_name == "AMIO Adaptive" else 75.0
+
+        in_flight.append((arrival_ms + ttft, finish_ms, seq_id, kv_mb))
 
         ttfts.append(ttft)
         qualities.append(quality)
-        frags.append(frag)
-        kv_mbs.append(kv_mb)
         if ttft <= sla_budget_ms:
             n_sla_pass += 1
 
-        # Model decode queue growth (saturates at 20)
-        n_decoding = min(n_decoding + 1, 20)
-
     n = len(ttfts)
     ttfts_s = sorted(ttfts)
-    p99_idx = min(int(0.99 * n), n - 1)
-    wall_s  = (reqs_data[-1][2] - reqs_data[0][2]) / 1000.0 + 1.0
+    # Achieved throughput: completions per second of simulated wall time
+    span_s = max(1e-9, (max(completion_times) - reqs_data[0][2]) / 1000.0)
 
     return BenchmarkResult(
         system_name=system_name,
@@ -1030,17 +1205,18 @@ def _simulate_system(
         n_requests=n,
         sla_pass_rate=n_sla_pass / n if n > 0 else 0.0,
         avg_ttft_ms=sum(ttfts) / n,
-        p99_ttft_ms=ttfts_s[p99_idx],
+        p99_ttft_ms=_percentile(ttfts_s, 0.99),
         avg_quality=sum(qualities) / n,
-        avg_frag_pct=sum(frags) / n,
-        throughput=n / wall_s,
+        avg_frag_pct=(sum(frags) / len(frags)) if frags else 0.0,
+        throughput=n / span_s,
         n_fallbacks=n_fallbacks,
+        n_kv_alloc_failures=n_kv_fail,
     )
 
 
 def run_benchmark_matrix(seed: int = 42) -> List[BenchmarkResult]:
     """
-    Run the comparative test matrix:
+    Run the comparative test matrix (ALL SIMULATED — no model):
 
     Variables
     ---------
@@ -1050,10 +1226,15 @@ def run_benchmark_matrix(seed: int = 42) -> List[BenchmarkResult]:
     - Systems:      Static Baseline / Greedy Fast / AMIO Adaptive
 
     Total runs: 4 × 4 × 3 × 3 = 144 simulation runs.
+
+    Thrpt column = ACHIEVED req/s derived from simulated completion times.
+    KVfail = KV pool exhaustion events (counted, not painted over).
     """
     print()
     print("=" * 74)
-    print("  Phase 7 — Comparative Test Matrix")
+    print("  Phase 7 — Comparative Test Matrix  (SIMULATED — no model loaded)")
+    print("  All three systems are graded by the same cost model the AMIO")
+    print("  controller optimizes against — a model-vs-model comparison.")
     print("=" * 74)
 
     RESOLUTIONS:   List[int]   = [224, 448, 756, 1024]
@@ -1066,7 +1247,8 @@ def run_benchmark_matrix(seed: int = 42) -> List[BenchmarkResult]:
 
     hdr = (
         f"  {'System':>18}  {'Res':>5}  {'N':>4}  {'SLA':>5}  "
-        f"{'Pass%':>6}  {'AvgTTFT':>9}  {'P99':>8}  {'Qual':>6}  {'Frag%':>6}"
+        f"{'Pass%':>6}  {'AvgTTFT':>9}  {'P99':>8}  {'Qual':>6}  {'Frag%':>6}  "
+        f"{'Thrpt':>6}  {'KVfail':>6}"
     )
     print(hdr)
     print("  " + "─" * (len(hdr) - 2))
@@ -1091,7 +1273,8 @@ def run_benchmark_matrix(seed: int = 42) -> List[BenchmarkResult]:
                         f"  {sys_name:>18}  {resolution:>5}  {concurrency:>4}  "
                         f"{sla_ms:>5.0f}  {res.sla_pass_rate*100:>5.1f}%  "
                         f"{res.avg_ttft_ms:>9.1f}  {res.p99_ttft_ms:>8.1f}  "
-                        f"{res.avg_quality:>6.2f}  {res.avg_frag_pct:>5.1f}%"
+                        f"{res.avg_quality:>6.2f}  {res.avg_frag_pct:>5.1f}%  "
+                        f"{res.throughput:>6.2f}  {res.n_kv_alloc_failures:>6}"
                     )
 
             print("  " + "─" * (len(hdr) - 2))
@@ -1109,19 +1292,20 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
 
     (A) Throughput vs. SLA Pass Rate — across systems and concurrency levels
     (B) KV Memory Fragmentation — Paged (AMIO) vs Contiguous (Static)
+        (per-allocation waste under two ASSUMED policies — see kv_manager)
     (C) U-Curve Verification — Nova SM reallocator heatmap
     (D) Head-to-head aggregate comparison
     """
     print()
     print("=" * 74)
-    print("  Phase 7 — Pareto Frontier Analysis")
+    print("  Phase 7 — Pareto Frontier Analysis  (simulation outputs)")
     print("=" * 74)
 
     systems = ["Static Baseline", "Greedy Fast", "AMIO Adaptive"]
 
     # ── (A) SLA Pass Rate vs Throughput ─────────────────────────────────────
     print()
-    print("  (A)  SLA Pass Rate vs. Throughput  [SLA budget = 500 ms]")
+    print("  (A)  SLA Pass Rate vs. Achieved Throughput  [SLA budget = 500 ms]")
     print()
 
     concs = sorted({r.concurrency for r in all_results})
@@ -1150,6 +1334,8 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
     # ── (B) Memory Fragmentation ─────────────────────────────────────────────
     print()
     print("  (B)  KV Memory Fragmentation  —  Paged (AMIO) vs Contiguous (Static)")
+    print("       (per-allocation over-reservation under two assumed policies,")
+    print("        not measured allocator behavior)")
     print()
     resols = sorted({r.resolution for r in all_results})
     print(f"  {'Resolution':>12}  {'Static Frag%':>14}  {'AMIO Frag%':>12}  {'Reduction':>11}")
@@ -1174,7 +1360,7 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
 
     # ── (C) U-Curve: Nova SM heatmap ────────────────────────────────────────
     print()
-    print("  (C)  Nova SM Reallocator Heatmap  (% of total SMs given to vision)")
+    print("  (C)  Nova SM Reallocator Heatmap  (% of modeled compute shares to vision)")
     print("       █ = high vision share (more priority)  ░ = low (decode-dominant)")
     print()
 
@@ -1219,8 +1405,8 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
     print("  Rows = front-stage (vision/prefill) queue depth  (F=0..15 requests)")
     print("  Cols = decode worker queue depth                 (D=0..70 requests)")
     print("  Reading: as F increases (more vision pressure), Nova allocates more")
-    print("  SMs to vision. As D increases, decode worker claims the SM budget.")
-    print("  The full 100% (38 SMs) column at D=0 is the idle-decode state.")
+    print("  shares to vision. As D increases, decode claims the share budget.")
+    print("  The full 100% column at D=0 is the idle-decode state.")
 
     # ── (D) Head-to-head aggregate summary ──────────────────────────────────
     print()
@@ -1228,7 +1414,7 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
     print()
     hdr_d = (
         f"  {'System':>18}  {'SLA Pass%':>10}  {'AvgTTFT':>9}  "
-        f"{'P99TTFT':>9}  {'Quality':>8}  {'Frag%':>7}  {'Fallbacks':>10}"
+        f"{'P99TTFT':>9}  {'Quality':>8}  {'Frag%':>7}  {'Fallbacks':>10}  {'KVfail':>7}"
     )
     print(hdr_d)
     print("  " + "─" * (len(hdr_d) - 2))
@@ -1243,9 +1429,11 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
         qual_avg = sum(r.avg_quality   for r in recs) / n
         frag_avg = sum(r.avg_frag_pct  for r in recs) / n
         fb_total = sum(r.n_fallbacks   for r in recs)
+        kvf_total = sum(r.n_kv_alloc_failures for r in recs)
         print(
             f"  {sys_name:>18}  {sla_avg:>9.1f}%  {ttft_avg:>9.1f}  "
-            f"{p99_avg:>9.1f}  {qual_avg:>8.3f}  {frag_avg:>6.1f}%  {fb_total:>10}"
+            f"{p99_avg:>9.1f}  {qual_avg:>8.3f}  {frag_avg:>6.1f}%  {fb_total:>10}  "
+            f"{kvf_total:>7}"
         )
     print()
 
@@ -1256,16 +1444,15 @@ def run_pareto_analysis(all_results: List[BenchmarkResult]) -> None:
     if amio_recs and static_recs and greedy_recs:
         amio_sla   = sum(r.sla_pass_rate for r in amio_recs)   / len(amio_recs) * 100
         static_sla = sum(r.sla_pass_rate for r in static_recs) / len(static_recs) * 100
-        greedy_sla = sum(r.sla_pass_rate for r in greedy_recs) / len(greedy_recs) * 100
         amio_qual  = sum(r.avg_quality   for r in amio_recs)   / len(amio_recs)
         greedy_qual= sum(r.avg_quality   for r in greedy_recs) / len(greedy_recs)
         static_frag= sum(r.avg_frag_pct  for r in static_recs) / len(static_recs)
         amio_frag  = sum(r.avg_frag_pct  for r in amio_recs)   / len(amio_recs)
-        print("  Key observations:")
+        print("  Key observations (simulation-internal — see honesty notes above):")
         print(f"    AMIO vs Static SLA advantage   : {amio_sla-static_sla:+.1f} pp")
-        print(f"    AMIO vs Greedy quality gain     : {amio_qual-greedy_qual:+.3f} (crop×keep)")
-        print(f"    Memory fragmentation reduction  : {static_frag:.1f}% → {amio_frag:.1f}%"
-              f"  (-{static_frag-amio_frag:.1f} pp)")
+        print(f"    AMIO vs Greedy quality gain     : {amio_qual-greedy_qual:+.3f} (crop×keep proxy)")
+        print(f"    Per-allocation KV waste         : {static_frag:.1f}% → {amio_frag:.1f}%"
+              f"  (-{static_frag-amio_frag:.1f} pp; policy comparison)")
     print()
 
 
@@ -1282,7 +1469,7 @@ def run_api_demo(port: int = 18_080) -> None:
 
     print()
     print("=" * 74)
-    print("  Phase 7 — OpenAI-Compatible API Demo")
+    print("  Phase 7 — OpenAI-Format API Demo  (SIMULATED — no model loaded)")
     print("=" * 74)
 
     orch   = SystemOrchestrator(log_telemetry=True)
@@ -1306,9 +1493,9 @@ def run_api_demo(port: int = 18_080) -> None:
 
     print(
         f"  {'#':>2}  {'Res':>5}  {'Crops':>5}  {'SM v/d':>7}  "
-        f"{'Pred ms':>8}  {'Act ms':>7}  {'SLA':>5}  {'Quality':>8}"
+        f"{'Pred ms':>8}  {'Sim ms':>7}  {'Wall ms':>8}  {'SLA':>5}  {'Quality':>8}"
     )
-    print("  " + "─" * 58)
+    print("  " + "─" * 66)
 
     for i, body in enumerate(sample_bodies, start=1):
         raw = json.dumps(body).encode()
@@ -1320,15 +1507,16 @@ def run_api_demo(port: int = 18_080) -> None:
         )
         try:
             with _urllib.urlopen(http_req, timeout=30) as resp:
-                crops   = resp.headers.get("X-AMIO-N-Crops",          "?")
-                sm_part = resp.headers.get("X-AMIO-SM-Partition",     "?")
-                pred    = resp.headers.get("X-AMIO-Predicted-TTFT-MS","?")
-                act     = resp.headers.get("X-AMIO-Actual-TTFT-MS",   "?")
-                sla     = resp.headers.get("X-AMIO-SLA-Pass",         "?")
-                qual    = resp.headers.get("X-AMIO-Quality-Score",    "?")
+                crops   = resp.headers.get("X-AMIO-N-Crops",           "?")
+                sm_part = resp.headers.get("X-AMIO-SM-Partition",      "?")
+                pred    = resp.headers.get("X-AMIO-Predicted-TTFT-MS", "?")
+                sim     = resp.headers.get("X-AMIO-Simulated-TTFT-MS", "?")
+                wall    = resp.headers.get("X-AMIO-Wall-TTFT-MS",      "?")
+                sla     = resp.headers.get("X-AMIO-SLA-Pass",          "?")
+                qual    = resp.headers.get("X-AMIO-Quality-Score",     "?")
                 print(
                     f"  {i:>2}  {body['image_resolution']:>5}  {crops:>5}  {sm_part:>7}  "
-                    f"{pred:>8}  {act:>7}  {sla:>5}  {qual:>8}"
+                    f"{pred:>8}  {sim:>7}  {wall:>8}  {sla:>5}  {qual:>8}"
                 )
         except Exception as exc:
             print(f"  {i:>2}  ERROR: {exc}")
@@ -1347,7 +1535,7 @@ def run_api_demo(port: int = 18_080) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 7: AMIO Full System Integration",
+        description="Phase 7: AMIO Full System Integration (SIMULATION — no model)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -1381,9 +1569,13 @@ def main() -> None:
     # ── Default: full benchmark run ──────────────────────────────────────
     print()
     print("=" * 74)
-    print("  Phase 7: Full System Integration")
+    print("  Phase 7: Full System Integration — SIMULATION SERVICE")
+    print("  *** No model is loaded. All latencies are analytic formulas ***")
+    print("  *** + Gaussian noise; responses are placeholders.          ***")
     print("  SmolVLM-Instruct-4bit (A)daptive (M)ultimodal (I)nference (O)ptimizer")
-    print("  Apple M3  ·  8 GB unified  ·  38 GPU SMs  ·  100 GB/s bandwidth")
+    print(f"  Modeled hardware: Apple M3 · 8 GB unified · {M3_TOTAL_SMS} compute shares")
+    print("  ('shares' are a modeling abstraction — the M3 has 10 GPU cores and")
+    print("   Metal exposes no per-task partitioning)")
     print("=" * 74)
 
     # Section 3: orchestrator pipeline demo
@@ -1397,7 +1589,7 @@ def main() -> None:
     run_pareto_analysis(all_results)
 
     print("=" * 74)
-    print("  Phase 7 complete.")
+    print("  Phase 7 complete.  (simulation — no model was loaded or run)")
     print("  Run with --api to start the persistent HTTP server.")
     print("  Run with --api-test for an interactive API demo.")
     print("=" * 74)
