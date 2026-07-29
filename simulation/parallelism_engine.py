@@ -12,10 +12,20 @@ Integrates the three Phase 3 sub-systems into a single planning API:
 The engine consults (in order):
   1. ResolutionScaler      — find minimum crop count that fits the SLA
   2. TPSimulator           — compare TP / DP / HYBRID communication cost
-  3. SMOrchestrator        — partition M3 SMs between vision and decode workers
+                             (HYPOTHETICAL multi-device projections only)
+  3. SMOrchestrator        — partition modeled compute shares between the
+                             vision and decode workers
 
 The output `InferenceExecutionPlan` contains the recommended settings and
 predicted end-to-end latency for a single prefill + decode step.
+
+COHERENCE NOTE (fixes the earlier TTFT splice): `predicted_ttft_ms` is
+computed from ONE coherent single-M3 model — share-scaled vision plus the
+UNADJUSTED LM prefill cost model.  The TP/DP comparison is exposed only as
+a separate, clearly-labeled multi-device projection
+(`parallelism_detail` / `multi_device_projection_ttft_ms`) and is NEVER
+folded into the M3 TTFT: single-chip "TP gains" are not realizable (M3 is
+a single-GPU part; see simulation/tp_simulator.py).
 
 Design note: all numbers are *analytical predictions*, not wall-clock
 measurements.  The engine is a planning oracle; the actual inference system
@@ -37,40 +47,45 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import amio_constants as C
+
 from simulation.tp_simulator import (
     ParallelismMode,
     ParallelismCostResult,
     compare_parallelism_modes,
-    BASELINE_T_VISION_MS as TP_BASELINE_VISION,
-    BASELINE_T_LM_MS as TP_BASELINE_LM,
-    BASELINE_N_CROPS as TP_BASELINE_CROPS,
 )
-from simulation.sm_orchestrator import SMOrchestrator, SMAllocation, M3_TOTAL_SMs
+from simulation.sm_orchestrator import (
+    SMOrchestrator,
+    SMAllocation,
+    M3_TOTAL_SMs,
+    predict_tbt_ms,
+)
 from simulation.resolution_scaler import (
     ResolutionScaler,
     ScalingPlan,
-    BASELINE_T_VISION_MS as RS_BASELINE_VISION,
-    BASELINE_N_CROPS as RS_BASELINE_CROPS,
+    max_crops_for_resolution,
 )
 
 # ---------------------------------------------------------------------------
-# Resolution → crop-count table (SmolVLM tiling)
+# Processor-size policy map (MEASURED; amio_constants.CROP_SETTINGS).
+# Keys are the processor's size.longest_edge settings; these are the ONLY
+# crop counts that exist ({1, 5, 10, 17}; the old 24-crop entry never did).
 # ---------------------------------------------------------------------------
-RESOLUTION_TO_CROPS: dict[int, int] = {
-    224:  1,
-    336:  4,
-    448:  6,
-    512:  9,
-    756: 13,
-    1008: 21,
-    1512: 24,   # = calibration baseline
-}
+RESOLUTION_TO_CROPS: dict[int, int] = dict(C.CROP_SETTINGS)   # {384:1, 768:5, 1152:10, 1536:17}
+
+BASELINE_N_CROPS: int = C.MAX_CROPS                           # 17
+BASELINE_TOTAL_TOKENS: int = C.TOKENS_PER_CONFIG[C.MAX_CROPS] # 1560
 
 
 def _nearest_crop_count(resolution_px: int) -> int:
-    """Map an arbitrary pixel resolution to the nearest crop count entry."""
-    best_res = min(RESOLUTION_TO_CROPS.keys(), key=lambda r: abs(r - resolution_px))
-    return RESOLUTION_TO_CROPS[best_res]
+    """
+    Serving policy (documented): cap crops at the processor setting whose
+    size.longest_edge ≥ min(image_resolution, 1536) — splitting a 384 px
+    image into 17 crops would model compute the encoder never performs.
+    E.g. 600 px → 768 setting → 5 crops; 1200 px → 1536 → 17 crops.
+    Delegates to resolution_scaler.max_crops_for_resolution.
+    """
+    return max_crops_for_resolution(resolution_px)
 
 
 # ---------------------------------------------------------------------------
@@ -84,22 +99,35 @@ class InferenceExecutionPlan:
 
     Fields
     ------
-    parallelism_mode    : recommended ParallelismMode (TP / DP / HYBRID)
-    sm_vision           : SMs allocated to vision/prefill worker
-    sm_decode           : SMs allocated to decode worker
+    parallelism_mode    : recommended ParallelismMode (TP / DP / HYBRID) —
+                          a MULTI-DEVICE PROJECTION recommendation only;
+                          it does not affect predicted_ttft_ms
+    sm_vision           : compute shares allocated to vision/prefill worker
+    sm_decode           : compute shares allocated to decode worker
     n_crops             : number of image crops to encode
     resolution_fraction : fraction of max resolution (1512 px = 1.0)
     lm_pruning_ratio    : fraction of visual tokens retained for LM (1.0 = none)
     total_visual_tokens : visual token count fed into LM
-    predicted_t_vision_ms : vision encoder latency under plan
-    predicted_t_lm_ms     : LM prefill latency under plan
-    predicted_t_decode_ms : decode latency per token step
-    predicted_ttft_ms     : total time-to-first-token = T_vision + T_lm
+    predicted_t_vision_ms : vision encoder latency under plan (share-scaled)
+    predicted_t_lm_ms     : LM prefill latency under plan (UNADJUSTED cost
+                            model — no TP discount)
+    predicted_t_decode_ms : decode latency per token step (shared TBT model)
+    predicted_ttft_ms     : single-M3 TTFT = share-scaled T_vision + T_lm,
+                            from ONE coherent model; contains NO multi-device
+                            TP/DP adjustment
     sla_budget_ms         : SLA target this plan was optimised for
     sla_pass              : True if predicted_ttft_ms ≤ sla_budget_ms
-    throughput_gain_pct   : latency reduction vs naive sequential baseline
-    overlap_savings_ms    : pipeline overlap savings from SM partitioning
-    parallelism_detail    : ParallelismCostResult for the chosen mode
+    throughput_gain_pct   : TOTAL latency reduction vs naive baseline
+                            (= iso-quality + quality-tradeoff components)
+    iso_quality_gain_pct  : gain vs baseline at UNCHANGED quality (same
+                            24 crops / full tokens) — pure systems effect
+    quality_tradeoff_gain_pct : remainder of the total gain, bought by crop
+                            reduction / token pruning (quality tradeoff)
+    overlap_savings_ms    : pipeline overlap savings from share partitioning
+    multi_device_projection_ttft_ms : hypothetical vision+LM total under the
+                            recommended TP/DP mode — projection ONLY, never
+                            part of predicted_ttft_ms
+    parallelism_detail    : ParallelismCostResult (multi-device projection)
     sm_allocation         : SMAllocation object
     scaling_plan          : ResolutionScaler ScalingPlan
     notes                 : human-readable explanation
@@ -135,6 +163,9 @@ class InferenceExecutionPlan:
     sm_allocation: SMAllocation
     scaling_plan: ScalingPlan
     notes: str = ""
+    iso_quality_gain_pct: float = 0.0
+    quality_tradeoff_gain_pct: float = 0.0
+    multi_device_projection_ttft_ms: float = 0.0
 
     def summary(self) -> str:
         flag = "PASS" if self.sla_pass else "FAIL"
@@ -143,18 +174,24 @@ class InferenceExecutionPlan:
             "AMIO Inference Execution Plan",
             "=" * 70,
             f"  SLA target       : {self.sla_budget_ms:.0f} ms   [{flag}]",
-            f"  Predicted TTFT   : {self.predicted_ttft_ms:.1f} ms",
+            f"  Predicted TTFT   : {self.predicted_ttft_ms:.1f} ms "
+            f"(single-M3 model: share-scaled vision + unadjusted LM)",
             "",
-            "  Parallelism",
-            f"    mode           : {self.parallelism_mode.value}",
-            f"    SM vision      : {self.sm_vision}",
-            f"    SM decode      : {self.sm_decode}",
+            "  Compute-share partition (abstract shares, not hardware units)",
+            f"    shares vision  : {self.sm_vision}",
+            f"    shares decode  : {self.sm_decode}",
             f"    overlap savings: {self.overlap_savings_ms:.1f} ms",
             "",
+            "  Multi-device projection (HYPOTHETICAL — M3 is single-GPU;",
+            "  never folded into the TTFT above)",
+            f"    mode           : {self.parallelism_mode.value}",
+            f"    projected total: {self.multi_device_projection_ttft_ms:.1f} ms",
+            "",
             "  Resolution / Crops",
-            f"    n_crops        : {self.n_crops}  (baseline 24)",
+            f"    n_crops        : {self.n_crops}  (baseline {BASELINE_N_CROPS})",
             f"    res fraction   : {self.resolution_fraction:.3f}×",
-            f"    visual tokens  : {self.total_visual_tokens}  (baseline 1548)",
+            f"    visual tokens  : {self.total_visual_tokens}  "
+            f"(baseline {BASELINE_TOTAL_TOKENS})",
             f"    LM pruning     : {self.lm_pruning_ratio:.3f}  (1.0 = no pruning)",
             "",
             "  Stage Latencies",
@@ -162,7 +199,10 @@ class InferenceExecutionPlan:
             f"    T_lm_prefill   : {self.predicted_t_lm_ms:.1f} ms",
             f"    T_decode/tok   : {self.predicted_t_decode_ms:.1f} ms",
             "",
-            f"  Throughput gain  : {self.throughput_gain_pct:+.1f}% vs sequential",
+            f"  Total gain       : {self.throughput_gain_pct:+.1f}% vs sequential baseline",
+            f"    iso-quality    : {self.iso_quality_gain_pct:+.1f}% "
+            f"(systems only, same {BASELINE_N_CROPS} crops)",
+            f"    quality-cost   : {self.quality_tradeoff_gain_pct:+.1f}% (bought by crop/token reduction)",
             f"  Notes            : {self.notes}",
             "=" * 70,
         ]
@@ -196,7 +236,8 @@ class ParallelismEngine:
         self.total_sms = total_sms
         self.decode_budget_fraction = decode_budget_fraction
         self._sm_orch = SMOrchestrator(total_sms=total_sms)
-        self._res_scaler = ResolutionScaler()
+        # (a per-call ResolutionScaler is built in plan() with the caller's
+        # SLA; no engine-level scaler instance is kept)
 
     # ------------------------------------------------------------------
     # Main planning entry point
@@ -224,33 +265,34 @@ class ParallelismEngine:
         -------
         InferenceExecutionPlan
         """
-        # --- 0. Initialise scaler with correct SLA ---
-        scaler = ResolutionScaler(
-            sla_budget_ms=sla_budget_ms,
-            baseline_t_vision_ms=RS_BASELINE_VISION,
-            baseline_n_crops=RS_BASELINE_CROPS,
-        )
+        # --- 0. Initialise scaler with correct SLA (measured cost models) ---
+        scaler = ResolutionScaler(sla_budget_ms=sla_budget_ms)
 
         # --- 1. Resolution scaler: find optimal crop count ---
+        # The request's image resolution bounds the useful crop settings
+        # (processor-size policy: smallest longest_edge ≥ min(res, 1536)).
+        max_crops_for_res = _nearest_crop_count(resolution)
         scaling_plan = scaler.find_optimal_crops(
             n_pending_requests=n_pending_requests,
             decode_budget_fraction=self.decode_budget_fraction,
+            max_crops=max_crops_for_res,
         )
-
-        # Cap crops at what the requested resolution naturally produces
-        max_crops_for_res = _nearest_crop_count(resolution)
         n_crops = min(scaling_plan.n_crops, max_crops_for_res)
 
-        # Recompute vision latency for the selected crop count
+        # Recompute vision latency for the selected crop count (measured
+        # linear model) and LM tokens from the measured per-config totals.
         t_vision = scaler.predict_t_vision(n_crops)
-        total_tokens = max(
-            1, int(1548 * (n_crops / RS_BASELINE_CROPS))
+        total_tokens = C.TOKENS_PER_CONFIG.get(
+            n_crops, C.TOKENS_PER_CROP * n_crops + 19
         )
         pruned_tokens = int(total_tokens * scaling_plan.lm_pruning_ratio)
         pruned_tokens = max(pruned_tokens, 1)
         t_lm = scaler.predict_t_lm(pruned_tokens)
 
         # --- 2. Parallelism mode comparison ---
+        # HYPOTHETICAL MULTI-DEVICE PROJECTION ONLY: compared and reported,
+        # but NEVER folded into the single-M3 TTFT below (single-chip TP
+        # gains are not realizable — see simulation/tp_simulator.py).
         para_results = compare_parallelism_modes(
             t_vision_ms=t_vision,
             t_lm_ms=t_lm,
@@ -262,52 +304,61 @@ class ParallelismEngine:
         chosen_mode_key = para_results["recommended"].mode.name  # "TP"/"DP"/"HYBRID"
         chosen_result: ParallelismCostResult = para_results[chosen_mode_key]
 
-        # Use the parallelism-adjusted total latency for vision+LM
-        t_vision_adjusted = (
-            chosen_result.t_total_ms
-            * (t_vision / (t_vision + t_lm))
-            if (t_vision + t_lm) > 0 else t_vision
-        )
-        t_lm_adjusted = chosen_result.t_total_ms - t_vision_adjusted
-
-        # --- 3. SM Orchestrator: partition SMs ---
+        # --- 3. SM Orchestrator: partition compute shares ---
         sm_alloc = SMOrchestrator(total_sms=self.total_sms).allocate(
             n_pending_decode=n_pending_requests,
             n_crops=n_crops,
         )
 
-        # Rescale vision latency for actual SM allotment
-        # (Already included in SMAllocation.t_vision_ms)
+        # --- 4. ONE coherent single-M3 TTFT model ---
+        # share-scaled vision (from the SM model) + UNADJUSTED LM prefill
+        # (Phase-2 cost model).  No TP/DP adjustment enters here.
         t_vision_final = sm_alloc.t_vision_ms
-        t_lm_final = t_lm_adjusted  # LM runs after vision in current design
+        t_lm_final = t_lm
 
-        # Decode latency estimate (memory-bandwidth bound; ~0.9 tok/s on M3)
-        t_decode_ms = 1111.0  # ms per generated token at baseline
+        # Decode latency per step from the shared bandwidth-based TBT model
+        t_decode_ms = predict_tbt_ms(batch_size=max(n_pending_requests, 1))
 
         t_ttft = t_vision_final + t_lm_final
 
-        # Overlap savings from pipelined SM execution
+        # Overlap savings from pipelined execution: vision overlaps with the
+        # CONCURRENT DECODE step (passed via t_concurrent_ms — the earlier
+        # code shipped decode time in a parameter named t_lm_ms).
         overlap_savings = self._sm_orch.predict_stage_overlap_savings(
             sm_vision=sm_alloc.sm_vision,
             sm_decode=sm_alloc.sm_decode,
             t_vision_ms=t_vision_final,
-            t_lm_ms=t_decode_ms * n_pending_requests,
+            t_concurrent_ms=t_decode_ms,
         )
 
         sla_pass = t_ttft <= sla_budget_ms
 
-        # Throughput gain vs naive baseline (8,483 ms TTFT)
-        baseline_ttft = RS_BASELINE_VISION + scaler.predict_t_lm(1548)
+        # --- Gains vs naive baseline (17 crops / 1560 tokens, full shares), ---
+        # --- decomposed honestly ---
+        # iso-quality: same max crops / full tokens, systems effects only
+        # (here: the share-scaled vision worker — usually a PENALTY when
+        # decode steals shares).  quality-tradeoff: the remainder, bought by
+        # crop reduction / token pruning.
+        baseline_vision_ms = (
+            C.VISION_MS_PER_CROP * BASELINE_N_CROPS + C.VISION_FIXED_MS
+        )
+        baseline_ttft = baseline_vision_ms + scaler.predict_t_lm(BASELINE_TOTAL_TOKENS)
+        t_iso_quality = (
+            self._sm_orch._scale_vision_latency(sm_alloc.sm_vision, BASELINE_N_CROPS)
+            + scaler.predict_t_lm(BASELINE_TOTAL_TOKENS)
+        )
         throughput_gain = (baseline_ttft - t_ttft) / baseline_ttft * 100.0
+        iso_quality_gain = (baseline_ttft - t_iso_quality) / baseline_ttft * 100.0
+        quality_tradeoff_gain = throughput_gain - iso_quality_gain
 
-        res_fraction = math.sqrt(n_crops / RS_BASELINE_CROPS)
+        res_fraction = math.sqrt(n_crops / BASELINE_N_CROPS)
         pruning_ratio = min(scaling_plan.lm_pruning_ratio, 1.0)
 
         notes = (
-            f"{chosen_mode_key} parallelism; "
-            f"{n_crops}/{RS_BASELINE_CROPS} crops; "
+            f"{chosen_mode_key} recommended (multi-device projection only); "
+            f"{n_crops}/{BASELINE_N_CROPS} crops; "
             f"{pruned_tokens}/{total_tokens} tokens retained; "
-            f"SMs {sm_alloc.sm_vision}V/{sm_alloc.sm_decode}D"
+            f"shares {sm_alloc.sm_vision}V/{sm_alloc.sm_decode}D"
         )
 
         return InferenceExecutionPlan(
@@ -330,6 +381,9 @@ class ParallelismEngine:
             sm_allocation=sm_alloc,
             scaling_plan=scaling_plan,
             notes=notes,
+            iso_quality_gain_pct=iso_quality_gain,
+            quality_tradeoff_gain_pct=quality_tradeoff_gain,
+            multi_device_projection_ttft_ms=chosen_result.t_total_ms,
         )
 
     # ------------------------------------------------------------------

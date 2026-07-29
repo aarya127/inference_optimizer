@@ -1,3 +1,11 @@
+# ============================================================================
+# STALE — describes the earlier LLaVA-1.5-7B / M3-16GB design phase; not read
+# by the current SmolVLM simulation modules; retained for provenance.
+# The model actually used by the study is mlx-community/SmolVLM-Instruct-4bit
+# (SigLIP-SO400M vision + SmolLM2-1.7B-class LM); see amio_constants.py for
+# the corrected ground-truth constants.
+# ============================================================================
+
 # AMIO Phase 0 - Multimodal Model Configuration
 
 # 3B Parameter Multimodal Models for M3 Mac (8GB)

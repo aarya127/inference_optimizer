@@ -1,66 +1,88 @@
 """
 W4A8 Quantizer — Dual-Precision Weight / Activation Quantization (Phase 4)
 
-Phase 1 revealed the decode stage is memory-bandwidth bound at 0.9 tok/s.
-The primary lever for bandwidth-bound kernels is reducing bytes transferred
-per arithmetic operation.  This module models the W4A8 strategy:
+MEASURED BASELINE (baseline/results_v2.json): decode on the shipped
+mlx-community/SmolVLM-Instruct-4bit checkpoint (weights ALREADY 4-bit,
+i.e. W4A16) measures TBT(ctx) = 18.33 + 0.00320·ctx ms at batch 1 —
+≈23.3 ms at 1548 ctx (raw measured mean 24.7 ms).  The old 217.7 ms
+single-trial figure is SUPERSEDED.  All gains in this module are reported
+relative to the measured W4A16 reference; the FP16 column is a MODELED
+HYPOTHETICAL (what an FP16-weight variant would cost under the same
+roofline model), clearly labeled as such.
 
-  W4  (INT4 weight storage)  — 4× memory footprint reduction vs FP16.
-  A8  (FP8 activations)      — 2× throughput improvement vs FP16 GEMMs.
-  GAR (Group-Aware Reordering) — prevents accuracy loss from double
-      quantisation by reordering weight groups according to Hessian
-      importance *before* INT4 packing; zero inference-time overhead.
+ROOFLINE HONESTY: streaming the 1390 MiB W4 weights takes ~14.6 ms of the
+~23.3 ms step; the remaining ~8.7 ms is fixed framework/attention overhead
+plus the ctx-proportional KV read.  Weights are already at 4 bits — the
+only remaining byte-reduction levers (KV quant, activation quant) touch a
+small slice of the step, so quantisation gains are structurally tiny
+(computed below, typically ≈1.0x vs W4A16).  Decode's non-GEMM overhead
+share is computed and printed, not asserted.
 
-Roofline analysis (M3 Mac)
---------------------------
-  Bandwidth : 100 GB/s
-  Compute   : 3.6 TFLOPS FP16
-  Ridge pt  : 36 FLOP/byte
+NO FP8 ON M3: the previous "7.2 TFLOPS FP8 on AMX" claim was fabricated —
+M3 has no FP8 GEMM path and MLX exposes none.  The activation-speedup knob
+is retained only as a clearly-labeled HYPOTHETICAL INT8-accelerated path
+(not available in MLX on M3) and is applied ONLY to the compute-bound term
+of a proper roofline max(bytes/BW, flops/FLOPS) — never to bandwidth time.
 
-  Decode is memory-bound: each forward pass reads model weights once.
-  Bytes transferred determines latency:
+Decode step model (shared with simulation/sm_orchestrator.py):
 
-    T_decode ∝ weight_bytes_transferred / bandwidth
+    TBT(b) = overhead + gemm_roofline(scheme) × (1 + dequant)
+             + (b − 1) × (seq_len × kv_bytes/token / BW)
 
-  FP16 baseline (SmolVLM ≈ 500 M params):
-    weight_bytes = 500e6 × 2 = 1,000 MB → T_decode = 10 ms/token (theoretical)
-    Measured: ~1,111 ms/token (overhead from framework, KV cache, non-linear ops)
-
-  With W4:
-    weight_bytes = 500e6 × 0.5 = 250 MB → 4× reduction
-  With A8 (FP8 GEMM) — throughput doubles vs FP16 on M3 AMX:
-    effective flops = 7.2 TFLOPS FP8 (2× FP16)
-
-  Combined W4A8 expected TBT gain: 2×–3× (theoretical max 4×, real-world 2–3×
-  due to dequantisation overhead, KV traffic, and non-GEMM kernels).
+where `overhead` is the residual of the MEASURED W4A16 baseline after its
+modeled weight-stream time (≈8.7 ms of the 23.3 ms step), and batching
+shares the per-step weight read (the batch term is a modeled assumption).
 """
 
 from __future__ import annotations
 
 import math
+import os
+import sys
 from dataclasses import dataclass
-from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Allow sibling / parent imports when run as a script
+# ---------------------------------------------------------------------------
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import amio_constants
+from simulation.sm_orchestrator import (
+    kv_read_ms_per_seq,
+    KV_BYTES_PER_TOKEN_FP16,
+    KV_BYTES_PER_TOKEN_W8,
+)
 
 # ---------------------------------------------------------------------------
 # M3 hardware constants
 # ---------------------------------------------------------------------------
-M3_BW_GBps: float = 100.0            # memory bandwidth
+M3_BW_GBps: float = amio_constants.M3_MEMORY_BW_GBPS   # 100 GB/s
 M3_FLOPS_FP16: float = 3.6e12        # FP16 TFLOPS (3.6 TFLOPS)
-M3_FLOPS_FP8: float = 7.2e12         # FP8 throughput (2× FP16 on AMX)
 RIDGE_POINT_FP16: float = M3_FLOPS_FP16 / (M3_BW_GBps * 1e9)   # 36 FLOP/byte
-RIDGE_POINT_FP8: float = M3_FLOPS_FP8 / (M3_BW_GBps * 1e9)     # 72 FLOP/byte
+# NOTE: no FP8 ridge point — M3 has no FP8 GEMM path.
 
-# SmolVLM 4-bit model (Phase 1 ground truth already 4-bit loaded)
-MODEL_PARAMS: int = 500_000_000      # ~500 M LM parameters
+# Measured checkpoint: 1390 MiB, 4-bit, vision + LM combined (amio_constants)
+WEIGHT_BYTES_W4: float = amio_constants.MODEL_WEIGHTS_MB * 1024 ** 2
+# LM is SmolLM2-1.7B-class (see amio_constants model-identity correction);
+# used only for the FLOP term of the roofline (2 FLOPs/param/token).
+LM_PARAMS: int = 1_700_000_000
 BITS_FP16: int = 16
 BITS_W4: int = 4
 BITS_A8: int = 8
 
-# Phase 1 baseline decode throughput
-BASELINE_TBT_MS: float = 217.7       # ms per token (TBT, from results.json tbt_curve)
-BASELINE_SPIKE_TBT_MS: float = 1926.5  # TBT spike at heavy load
-TBT_HUMAN_THRESHOLD_MS: float = 80.0  # human-perceivable lag boundary
+# MEASURED decode baseline (baseline/results_v2.json), collected on the
+# ALREADY 4-bit checkpoint — i.e. this is the W4A16 reference, NOT an FP16
+# baseline.  Evaluated from the batch-1 fit at the 1548-ctx reference
+# context: 18.33 + 0.00320·1548 ≈ 23.3 ms (raw measured mean 24.7 ms).
+# The old single-trial 217.7 ms / 1926.5 ms spike figures are SUPERSEDED.
+BASELINE_CTX_TOKENS: int = 1548
+BASELINE_TBT_MS: float = (
+    amio_constants.DECODE_OVERHEAD_MS_MEASURED
+    + amio_constants.DECODE_KV_MS_PER_CTX_TOKEN * BASELINE_CTX_TOKENS
+)
+TBT_HUMAN_THRESHOLD_MS: float = amio_constants.TBT_SLA_MS  # 80 ms
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +98,9 @@ class QuantConfig:
     ----------
     name           : human-readable label
     weight_bits    : precision of stored weights (4 = INT4, 16 = FP16)
-    activation_bits: precision of activations during GEMM (8 = FP8, 16 = FP16)
+    activation_bits: precision of activations during GEMM (8, 16)
     group_size     : number of weights per quantisation group (for W4 group quant)
-    use_gar        : enable Group-Aware Reordering for accuracy preservation
+    use_gar        : enable Group-Aware Reordering (modeling assumption)
     dequant_overhead_pct : extra latency overhead from dequantisation (%)
     """
     name: str
@@ -95,19 +117,34 @@ class QuantConfig:
 
     @property
     def activation_throughput_scale(self) -> float:
-        """GEMM throughput factor vs FP16 on M3 AMX."""
+        """
+        HYPOTHETICAL INT8-accelerated compute path (NOT available in MLX on
+        M3 — the earlier 'FP8 on AMX' claim was fabricated).  Applied ONLY
+        to the compute-bound term of the roofline, never to bandwidth time.
+        """
         if self.activation_bits <= 8:
-            return 2.0    # FP8 doubles throughput
+            return 2.0
         return 1.0
+
+    @property
+    def kv_bytes_per_tok(self) -> int:
+        """Modeled KV bytes/token: 8-bit KV when activations are 8-bit."""
+        if self.activation_bits <= 8:
+            return KV_BYTES_PER_TOKEN_W8
+        return KV_BYTES_PER_TOKEN_FP16
 
 
 SCHEMES: dict[str, QuantConfig] = {
-    "fp16":    QuantConfig("FP16 baseline",         weight_bits=16, activation_bits=16),
-    "w8a16":   QuantConfig("W8A16 (INT8 weights)",  weight_bits=8,  activation_bits=16),
-    "w4a16":   QuantConfig("W4A16 (INT4 weights)",  weight_bits=4,  activation_bits=16, dequant_overhead_pct=8.0),
-    "w4a8":    QuantConfig("W4A8 (W4+FP8)",         weight_bits=4,  activation_bits=8,  use_gar=True, dequant_overhead_pct=6.0),
-    "w4a8_gar":QuantConfig("W4A8+GAR",              weight_bits=4,  activation_bits=8,  use_gar=True, dequant_overhead_pct=4.0),
+    "fp16":    QuantConfig("FP16 (modeled)",        weight_bits=16, activation_bits=16),
+    "w8a16":   QuantConfig("W8A16 (modeled)",       weight_bits=8,  activation_bits=16),
+    "w4a16":   QuantConfig("W4A16 (= baseline)",    weight_bits=4,  activation_bits=16, dequant_overhead_pct=8.0),
+    "w4a8":    QuantConfig("W4A8 (hyp. INT8)",      weight_bits=4,  activation_bits=8,  use_gar=True, dequant_overhead_pct=6.0),
+    "w4a8_gar":QuantConfig("W4A8+GAR (hyp. INT8)",  weight_bits=4,  activation_bits=8,  use_gar=True, dequant_overhead_pct=4.0),
 }
+
+# The measured ≈23.3 ms baseline corresponds to THIS scheme (shipped 4-bit
+# checkpoint, FP16 activations).  All gains are reported relative to it.
+BASELINE_SCHEME_KEY: str = "w4a16"
 
 
 # ---------------------------------------------------------------------------
@@ -120,23 +157,26 @@ class QuantAnalysisResult:
     config: QuantConfig
 
     # Memory
-    weight_bytes_fp16: int
+    weight_bytes_fp16: int      # modeled hypothetical FP16 footprint
     weight_bytes_quantized: int
-    memory_reduction_x: float
+    memory_reduction_x: float   # vs the modeled FP16 footprint
 
     # Bandwidth
-    bw_required_GBps: float     # weight bandwidth needed per decode step
-    bw_bound: bool              # True if below ridge point
+    bw_required_GBps: float     # weight-stream bandwidth at predicted TBT
+    bw_utilization_pct: float   # bw_required / available (the honest number)
+    bw_bound: bool              # True only if weight streaming dominates the
+                                # step (> 50% of TBT) — decode here is NOT
 
     # Throughput predictions
-    tbt_theoretical_ms: float   # purely from bandwidth model
-    tbt_predicted_ms: float     # with dequant overhead + empirical correction
-    tbt_gain_vs_fp16: float     # speedup factor vs FP16 baseline
+    tbt_theoretical_ms: float   # overhead + roofline GEMM (no dequant)
+    tbt_predicted_ms: float     # with dequant overhead
+    tbt_gain_vs_w4a16: float    # speedup vs the MEASURED W4A16 baseline
+    tbt_gain_vs_fp16: float     # speedup vs the MODELED FP16 hypothetical
 
     # SLA assessment
     sla_tbt_pass: bool          # tbt_predicted_ms ≤ 80 ms?
-    tbt_at_batch4_ms: float     # predicted TBT at batch_size=4
-    max_batch_below_threshold: int
+    tbt_at_batch4_ms: float     # shared batching model (weights read once)
+    max_batch_below_threshold: int  # 0 = threshold unmeetable at any batch
 
     # GAR note
     gar_note: str = ""
@@ -144,77 +184,109 @@ class QuantAnalysisResult:
 
 class W4A8Analyzer:
     """
-    Analytical predictor for W4A8 quantisation impact on SmolVLM decode.
+    Analytical predictor for quantisation impact on SmolVLM decode.
 
-    The model is:
-        T_decode = (weight_bytes / bandwidth) × overhead_factor
-                 + non_gemm_overhead_ms
+    Model (per decode step):
+        gemm_ms(scheme) = max(weight_bytes / BW, flops / FLOPS)   [roofline]
+        TBT(scheme)     = overhead + gemm_ms × (1 + dequant_pct)
 
-    Non-GEMM overhead (KV cache loads, softmax, layernorm) is assumed to be
-    a fixed ~30% of total decode time (conservative estimate).
+    `overhead` is anchored to the MEASURED W4A16 baseline: it is whatever
+    the ≈23.3 ms step (18.33 + 0.00320·1548, measured batch-1 fit) spends
+    outside the modeled weight stream (≈8.7 ms — framework overhead,
+    attention, KV read).  That residual is untouched by weight-byte
+    reduction, and the weights are already 4-bit, so further quantisation
+    gains are structurally tiny — decode has no weight bytes left to shed.
     """
-
-    NON_GEMM_FRACTION: float = 0.30   # fraction of decode time not in GEMMs
 
     def __init__(
         self,
-        model_params: int = MODEL_PARAMS,
+        lm_params: int = LM_PARAMS,
         bandwidth_GBps: float = M3_BW_GBps,
         baseline_tbt_ms: float = BASELINE_TBT_MS,
     ):
-        self.model_params = model_params
+        self.lm_params = lm_params
         self.bandwidth_GBps = bandwidth_GBps
         self.baseline_tbt_ms = baseline_tbt_ms
-        self._weight_bytes_fp16 = model_params * BITS_FP16 // 8
+        # Modeled FP16 footprint = 4× the measured 4-bit blob
+        self._weight_bytes_fp16 = int(WEIGHT_BYTES_W4 * 4)
 
-    def _gemm_tbt_ms(self, config: QuantConfig) -> float:
+        # Anchor the non-GEMM overhead so that the W4A16 scheme reproduces
+        # the measured baseline exactly.
+        ref = SCHEMES[BASELINE_SCHEME_KEY]
+        ref_gemm_ms = self._gemm_ms(ref) * (1.0 + ref.dequant_overhead_pct / 100.0)
+        self.overhead_ms = self.baseline_tbt_ms - ref_gemm_ms
+
+    # -- roofline terms ---------------------------------------------------
+
+    def _weight_bytes(self, config: QuantConfig) -> float:
+        """Scale the MEASURED 4-bit blob to the scheme's weight width."""
+        return WEIGHT_BYTES_W4 * config.weight_bits / 4.0
+
+    def _stream_ms(self, config: QuantConfig) -> float:
+        """Weight-stream time per step (bandwidth term)."""
+        return self._weight_bytes(config) / (self.bandwidth_GBps * 1e9) * 1000.0
+
+    def _compute_ms(self, config: QuantConfig) -> float:
         """
-        GEMM-only decode latency from bandwidth model.
+        GEMM FLOP time per token: ~2 FLOPs per LM parameter.  The
+        activation_throughput_scale (hypothetical INT8 path, not available
+        in MLX on M3) applies here and ONLY here.
         """
-        weight_bytes = self.model_params * config.weight_bits // 8
-        bw_latency_ms = (weight_bytes / (self.bandwidth_GBps * 1e9)) * 1000.0
-        gemm_latency_ms = bw_latency_ms / config.activation_throughput_scale
-        return gemm_latency_ms
+        flops = 2.0 * self.lm_params
+        return flops / (M3_FLOPS_FP16 * config.activation_throughput_scale) * 1000.0
+
+    def _gemm_ms(self, config: QuantConfig) -> float:
+        """Roofline: a kernel is limited by the slower of bytes and flops."""
+        return max(self._stream_ms(config), self._compute_ms(config))
+
+    # -- analysis ----------------------------------------------------------
 
     def analyze(self, config: QuantConfig) -> QuantAnalysisResult:
-        """Run full analysis for one QuantConfig."""
-        weight_bytes_q = self.model_params * config.weight_bits // 8
+        """Run full analysis for one QuantConfig (gains vs W4A16 baseline)."""
+        weight_bytes_q = int(self._weight_bytes(config))
         memory_reduction = self._weight_bytes_fp16 / weight_bytes_q
 
-        gemm_baseline_ms = self._gemm_tbt_ms(SCHEMES["fp16"])
-        gemm_quant_ms = self._gemm_tbt_ms(config)
+        gemm_ms = self._gemm_ms(config)
+        tbt_theoretical_ms = self.overhead_ms + gemm_ms
+        overhead_factor = 1.0 + config.dequant_overhead_pct / 100.0
+        tbt_predicted_ms = self.overhead_ms + gemm_ms * overhead_factor
 
-        # Non-GEMM portion stays constant
-        non_gemm_ms = self.baseline_tbt_ms * self.NON_GEMM_FRACTION
-        # GEMM portion scales down
-        gemm_fraction_ms = self.baseline_tbt_ms * (1 - self.NON_GEMM_FRACTION)
-        scaling_ratio = gemm_quant_ms / gemm_baseline_ms
-        tbt_theoretical_ms = non_gemm_ms + gemm_fraction_ms * scaling_ratio
+        # Gains: vs the MEASURED baseline (w4a16) and vs the MODELED FP16
+        gain_vs_w4a16 = self.baseline_tbt_ms / tbt_predicted_ms
+        fp16_cfg = SCHEMES["fp16"]
+        tbt_fp16_modeled = self.overhead_ms + self._gemm_ms(fp16_cfg)
+        gain_vs_fp16 = tbt_fp16_modeled / tbt_predicted_ms
 
-        # Add dequantisation overhead
-        overhead = 1.0 + config.dequant_overhead_pct / 100.0
-        tbt_predicted_ms = tbt_theoretical_ms * overhead
-
-        gain = self.baseline_tbt_ms / tbt_predicted_ms
-
-        # Bandwidth required per decode step
+        # Roofline honesty: actual bandwidth utilization at this TBT
+        stream_ms = self._stream_ms(config)
         bw_required = weight_bytes_q / (tbt_predicted_ms / 1000.0) / 1e9
-        bw_bound = bw_required < self.bandwidth_GBps
+        bw_utilization_pct = bw_required / self.bandwidth_GBps * 100.0
+        # Fixed semantics (previously inverted): bandwidth-bound only if the
+        # weight stream dominates the step.
+        bw_bound = stream_ms > 0.5 * tbt_predicted_ms
 
         sla_pass = tbt_predicted_ms <= TBT_HUMAN_THRESHOLD_MS
 
-        # Predict TBT at batch_size=4 (serialised token generation)
-        tbt_batch4 = tbt_predicted_ms * 4  # simplistic: no batching gain modelled here
+        # Batching (shared model with sm_orchestrator; MODELED — batch
+        # scaling unmeasured): weights are read once per step; each extra
+        # sequence adds only its KV reads (≈3.0 ms/seq at 1548 ctx FP16).
+        kv_ms = kv_read_ms_per_seq(BASELINE_CTX_TOKENS, config.kv_bytes_per_tok)
+        tbt_batch4 = tbt_predicted_ms + 3 * kv_ms
 
-        # Find max batch where TBT ≤ 80 ms
-        max_batch = max(1, int(TBT_HUMAN_THRESHOLD_MS / tbt_predicted_ms))
+        # Largest batch with TBT(b) ≤ threshold; 0 = unmeetable even at b=1
+        if tbt_predicted_ms > TBT_HUMAN_THRESHOLD_MS:
+            max_batch = 0
+        else:
+            max_batch = 1 + int(
+                (TBT_HUMAN_THRESHOLD_MS - tbt_predicted_ms) / kv_ms
+            )
 
         gar_note = ""
         if config.use_gar:
             gar_note = (
-                "GAR reorders weight groups by Hessian importance before INT4 packing. "
-                "This preserves accuracy equivalent to W8A16 at W4 memory cost, with "
-                "zero inference-time overhead (reordering is a one-time offline step)."
+                "GAR ('Group-Aware Reordering') is a MODELING ASSUMPTION of "
+                "this study, not a published method; its accuracy figures "
+                "are illustrative, with no literature citation."
             )
 
         return QuantAnalysisResult(
@@ -223,10 +295,12 @@ class W4A8Analyzer:
             weight_bytes_quantized=weight_bytes_q,
             memory_reduction_x=round(memory_reduction, 2),
             bw_required_GBps=round(bw_required, 2),
+            bw_utilization_pct=round(bw_utilization_pct, 1),
             bw_bound=bw_bound,
             tbt_theoretical_ms=round(tbt_theoretical_ms, 2),
             tbt_predicted_ms=round(tbt_predicted_ms, 2),
-            tbt_gain_vs_fp16=round(gain, 2),
+            tbt_gain_vs_w4a16=round(gain_vs_w4a16, 3),
+            tbt_gain_vs_fp16=round(gain_vs_fp16, 2),
             sla_tbt_pass=sla_pass,
             tbt_at_batch4_ms=round(tbt_batch4, 2),
             max_batch_below_threshold=max_batch,
@@ -252,24 +326,24 @@ class GARConfig:
 
 class GARAnalyzer:
     """
-    Models the offline GAR pass that prevents accuracy loss from W4 + A8
-    "double quantisation".
+    Models an offline "Group-Aware Reordering" (GAR) pass intended to limit
+    accuracy loss from W4 + A8 double quantisation.
 
-    GAR sorts weight groups in each layer by a proxy Hessian (e.g., squared
-    activation magnitudes), then reorders the INT4 packing so the most
-    important groups are aligned to the numerically best INT4 values.
+    HONESTY NOTE: "GAR" as described here matches no published method, and
+    the accuracy numbers below are NOT from QuaRot/SpinQuant (those are
+    rotation-based techniques and were previously miscited).  Everything in
+    this class is an ILLUSTRATIVE MODELING ASSUMPTION with no literature
+    citation, pending an actual quantisation-accuracy experiment.
 
-    This is a one-time offline operation.  The resulting weight tensor has
-    the same INT4 format but dramatically better accuracy (equivalent to W8A16
-    on most tasks per the literature).
-
-    Key claim: zero inference overhead because the reordering is baked into
-               the weight checkpoint.
+    The modeled mechanism: sort weight groups per layer by a proxy Hessian
+    (e.g., squared activation magnitudes), then reorder INT4 packing so the
+    most important groups get the numerically best INT4 values.  Offline,
+    one-time; zero inference-time overhead is the modeling claim.
     """
 
     def __init__(
         self,
-        model_params: int = MODEL_PARAMS,
+        model_params: int = LM_PARAMS,
         group_size: int = 128,
     ):
         self.model_params = model_params
@@ -278,21 +352,24 @@ class GARAnalyzer:
 
     def accuracy_preservation_estimate(self) -> dict:
         """
-        Return accuracy recovery estimates for different reordering strategies.
-        (Values from published W4A8 literature, e.g., QuaRot, SpinQuant.)
+        Return accuracy-recovery figures for different reordering strategies.
+
+        THESE VALUES ARE ILLUSTRATIVE MODELING ASSUMPTIONS — they are not
+        drawn from QuaRot, SpinQuant, or any published W4A8 result, and no
+        citation supports them.
         """
         return {
             "w4a8_no_gar": {
                 "ppl_degradation_pct": 8.5,
-                "notes": "Naïve W4A8: significant accuracy loss due to error amplification"
+                "notes": "Illustrative assumption (no citation): naive W4A8 loss"
             },
             "w4a8_with_gar": {
                 "ppl_degradation_pct": 1.2,
-                "notes": "GAR recovers ~86% of accuracy loss at zero inference cost"
+                "notes": "Illustrative assumption (no citation): GAR recovery"
             },
             "w4a16_with_gar": {
                 "ppl_degradation_pct": 0.5,
-                "notes": "W4A16+GAR: near-FP16 accuracy"
+                "notes": "Illustrative assumption (no citation): near-FP16"
             },
         }
 
@@ -312,7 +389,7 @@ class GARAnalyzer:
             "reorder_sort_ms": round(reorder_ms, 2),
             "total_gar_pass_s": round((hessian_compute_ms + reorder_ms) / 1000.0, 1),
             "inference_overhead_ms": 0.0,
-            "notes": "GAR is a one-time offline operation; adds zero latency per token",
+            "notes": "Modeled one-time offline pass; zero per-token latency (assumption)",
         }
 
 
@@ -321,59 +398,76 @@ class GARAnalyzer:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=" * 72)
-    print("AMIO Phase 4 — W4A8 Quantiser Analysis")
-    print("=" * 72)
+    print("=" * 78)
+    print("AMIO Phase 4 — W4A8 Quantiser Analysis (corrected W4A16 baseline)")
+    print("=" * 78)
 
     analyzer = W4A8Analyzer()
 
-    print(f"\nModel: {MODEL_PARAMS/1e6:.0f} M params, "
-          f"FP16 weight size: {MODEL_PARAMS*2/1e6:.0f} MB")
-    print(f"Note: SmolVLM-Instruct-4bit is ALREADY W4 loaded. FP16 is the analytical")
-    print(f"      reference; the 2.5× W4A8+GAR gain vs FP16 maps to the real 217.7 ms")
-    print(f"      baseline TBT, confirming W4A8 activation improvement → ~87 ms/tok.")
-    print(f"M3 bandwidth: {M3_BW_GBps} GB/s | "
-          f"Ridge point FP16: {RIDGE_POINT_FP16:.0f} FLOP/byte | "
-          f"FP8: {RIDGE_POINT_FP8:.0f} FLOP/byte")
-    print(f"Baseline TBT: {BASELINE_TBT_MS:.1f} ms | "
-          f"TBT SLA target: {TBT_HUMAN_THRESHOLD_MS:.0f} ms")
+    print(f"\nCheckpoint: SmolVLM-Instruct-4bit — weights ALREADY 4-bit "
+          f"({WEIGHT_BYTES_W4/1e6:.0f} MB measured blob).")
+    print(f"Baseline (MEASURED batch-1 fit, baseline/results_v2.json): W4A16 at "
+          f"{BASELINE_TBT_MS:.1f} ms/token ({BASELINE_CTX_TOKENS} ctx; raw "
+          f"measured mean 24.7 ms).  FP16 row is a MODELED hypothetical.")
+    print(f"M3 bandwidth: {M3_BW_GBps:.0f} GB/s | FP16 ridge point: "
+          f"{RIDGE_POINT_FP16:.0f} FLOP/byte | no FP8 path exists on M3")
+    print(f"Non-GEMM overhead residual: {analyzer.overhead_ms:.1f} ms/step "
+          f"({analyzer.overhead_ms/BASELINE_TBT_MS*100:.0f}% of the step; "
+          f"weights are already W4 — no weight bytes left to shed, so "
+          f"further quantisation gains are structurally tiny)")
     print()
 
     results = analyzer.compare_all()
-    print(f"  {'Scheme':<18} {'Wt MB':>6} {'Mem↓':>5}  "
-          f"{'BW GB/s':>7}  {'TBT ms':>7}  {'Gain':>5}  "
-          f"{'SLA':>4}  {'MaxBatch':>8}")
-    print("  " + "-" * 70)
+    print(f"  {'Scheme':<20} {'Wt MB':>6} {'Mem⇩':>5}  "
+          f"{'BW GB/s':>7} {'BW util':>7}  {'TBT ms':>7}  "
+          f"{'vs W4A16':>8} {'vs FP16*':>8}  {'SLA':>4}")
+    print("  " + "-" * 84)
     for key, r in results.items():
         flag = "PASS" if r.sla_tbt_pass else "FAIL"
         print(
-            f"  {r.config.name:<18} "
+            f"  {r.config.name:<20} "
             f"{r.weight_bytes_quantized/1e6:>5.0f}  "
-            f"{r.memory_reduction_x:>4.1f}×  "
-            f"{r.bw_required_GBps:>7.1f}  "
+            f"{r.memory_reduction_x:>4.1f}x  "
+            f"{r.bw_required_GBps:>7.1f} "
+            f"{r.bw_utilization_pct:>6.1f}%  "
             f"{r.tbt_predicted_ms:>7.1f}  "
-            f"{r.tbt_gain_vs_fp16:>4.1f}×  "
-            f"{flag}  "
-            f"{r.max_batch_below_threshold:>8}"
+            f"{r.tbt_gain_vs_w4a16:>7.3f}x "
+            f"{r.tbt_gain_vs_fp16:>7.2f}x  "
+            f"{flag}"
         )
+    print("  (* vs FP16 = vs the MODELED FP16 hypothetical, not a measurement)")
 
     print()
+    fp16_r = results["fp16"]
     w4a8_result = results["w4a8_gar"]
-    print(f"  W4A8+GAR achieves:")
+    print("  Roofline honesty (computed):")
+    print(f"    MODELED FP16 decode would stream "
+          f"{fp16_r.bw_required_GBps:.1f} GB/s of {M3_BW_GBps:.0f} GB/s "
+          f"({fp16_r.bw_utilization_pct:.1f}% utilization);")
+    print(f"    the measured W4 baseline uses {results['w4a16'].bw_utilization_pct:.1f}%. "
+          f"With weights already at 4 bits, the step is dominated by")
+    print(f"    fixed overhead + the minimal W4 weight stream — the remaining "
+          f"quantisation levers touch only "
+          f"{100 - analyzer.overhead_ms/BASELINE_TBT_MS*100:.0f}% of the step, "
+          f"and W4A8's computed gain vs W4A16 is "
+          f"{w4a8_result.tbt_gain_vs_w4a16:.3f}x.")
+    print()
+    print(f"  W4A8+GAR (hypothetical INT8 path, not available in MLX on M3):")
     print(f"    TBT = {w4a8_result.tbt_predicted_ms:.1f} ms  "
-          f"(gain: {w4a8_result.tbt_gain_vs_fp16:.1f}× vs FP16 baseline)")
-    print(f"    Weight memory: {w4a8_result.weight_bytes_quantized/1e6:.0f} MB "
-          f"(-{w4a8_result.memory_reduction_x:.0f}× vs FP16)")
-    print(f"    Max batch at TBT ≤ 80 ms: {w4a8_result.max_batch_below_threshold}")
+          f"(gain vs measured W4A16 baseline: {w4a8_result.tbt_gain_vs_w4a16:.3f}x)")
+    print(f"    TBT at batch 4 (shared batching model): "
+          f"{w4a8_result.tbt_at_batch4_ms:.1f} ms")
+    print(f"    Max batch at TBT <= {TBT_HUMAN_THRESHOLD_MS:.0f} ms: "
+          f"{w4a8_result.max_batch_below_threshold} (0 = unmeetable)")
     print()
 
     # GAR analysis
     gar = GARAnalyzer()
     acc = gar.accuracy_preservation_estimate()
     overhead = gar.overhead_analysis()
-    print("  GAR (Group-Aware Reordering):")
+    print("  GAR (illustrative modeling assumptions — no literature citation):")
     for scheme, info in acc.items():
-        print(f"    {scheme:<20}: perplexity degradation {info['ppl_degradation_pct']}%")
+        print(f"    {scheme:<20}: assumed perplexity degradation {info['ppl_degradation_pct']}%")
     print(f"  Offline GAR pass: ~{overhead['total_gar_pass_s']:.0f} s  "
           f"(inference overhead: {overhead['inference_overhead_ms']} ms)")
     print()

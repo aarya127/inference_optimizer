@@ -1,3 +1,18 @@
+# ============================================================================
+# STALE — describes the earlier LLaVA-1.5-7B / M3-16GB design phase; not read
+# by the current SmolVLM simulation modules; retained for provenance.
+#
+# Known errors preserved as-is below (do not trust these numbers):
+#   - `per_byte_latency_ns: 10` is a 1000x error: 10 ns/B corresponds to
+#     0.1 GB/s, NOT the "~100 GB/s" its comment claims.  100 GB/s is
+#     0.01 ns/B.  The current code (simulation/tp_simulator.py
+#     CommunicationConfig) derives the per-byte cost from bandwidth_gbps so
+#     the two can no longer contradict.  All example latency calculations in
+#     this file inherit the same 1000x error.
+#   - Model shapes are LLaVA-era (CLIP ViT-L 24x1024, Vicuna-7B 32x4096);
+#     the shipped SmolVLM is SigLIP 27x1152 + SmolLM2-class 24x2048.
+# ============================================================================
+
 # Tensor Parallelism Simulation Configuration for Single-GPU M3
 
 # Overview
@@ -21,7 +36,10 @@ simulation:
     # Latency model for All-Reduce operations
     all_reduce_latency:
       base_latency_us: 50          # Base synchronization overhead
-      per_byte_latency_ns: 10      # Bandwidth: ~100 GB/s (NVLink)
+      per_byte_latency_ns: 10      # WRONG COMMENT FIXED: 10 ns/B = 0.1 GB/s,
+                                   # not "~100 GB/s"; 100 GB/s would be
+                                   # 0.01 ns/B (see header note; the code now
+                                   # derives this value from bandwidth_gbps)
       synchronization_overhead_us: 20  # Barrier/coordination overhead
       
     # Example calculation for typical all-reduce:
