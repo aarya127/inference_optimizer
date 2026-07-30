@@ -2,6 +2,17 @@
 
 **Adaptive Multimodal Inference Optimizer - Week 0 Technical Boundaries**
 
+> **STALE — describes an earlier, abandoned design phase.** This document
+> scopes AMIO around **LLaVA-1.5-7B** on an **M3 with 16-36 GB** unified
+> memory. The study that was actually built and evaluated targets
+> **`mlx-community/SmolVLM-Instruct-4bit`** (Idefics3; ~2B-class text
+> backbone, hidden_size=2048, 24 layers + a 27-layer SigLIP vision encoder)
+> on an **M3 base with 8 GB** unified memory. None of the model sizes,
+> memory budgets, or "7B" framing below reflect the shipped system.
+> See `amio_constants.py` for the current, measured ground truth and
+> `REVIEW_FINDINGS.md` for how this document came to diverge from it.
+> Retained for provenance, not as current design.
+
 ---
 
 ## Executive Summary

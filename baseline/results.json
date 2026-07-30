@@ -1,4 +1,5 @@
 {
+  "_provenance": "SUPERSEDED by baseline/results_v2.json — produced by baseline/run_experiments.py, which has known methodology defects (no warm-up, no-op mx.eval(), fabricated percentiles, and a resolution sweep that never actually varies visual tokens). Do not treat as ground truth; see REVIEW_FINDINGS.md and amio_constants.py.",
   "model_id": "mlx-community/SmolVLM-Instruct-4bit",
   "model_config": {
     "num_layers": 24,

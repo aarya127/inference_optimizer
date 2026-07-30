@@ -1,6 +1,13 @@
 """
 Phase 0 Verification Script
 
+NOTE: every check here is a file-existence check only — none of them
+validate file contents. A "PASS" means the expected files were created,
+not that their contents are correct or current (e.g. config/model_config.yaml
+exists and passes, but its contents describe an abandoned LLaVA-7B design,
+not the SmolVLM system actually built — see docs/DESIGN.md's stale-content
+banner and REVIEW_FINDINGS.md).
+
 Runs comprehensive checks to ensure Phase 0 foundation is complete:
 1. File structure verification
 2. Tech stack validation
@@ -150,16 +157,18 @@ class Phase0Verifier:
         print("=" * 80)
         
         if self.checks_passed == self.checks_total:
-            print("\nPhase 0 foundation is COMPLETE!")
-            print("\nSuccess Criteria:")
-            print("  Directory structure created")
-            print("  Tech stack specification defined")
-            print("  7B multimodal model configuration implemented")
-            print("  4-bit quantization framework built")
-            print("  Single-GPU TP simulation created")
-            print("  Core performance metrics defined")
-            print("  SLA targets established")
-            print("  1-page design document generated")
+            print("\nPhase 0 file structure is COMPLETE (existence checks only).")
+            print("\nFiles present for:")
+            print("  Directory structure")
+            print("  Tech stack specification")
+            print("  Multimodal model configuration scaffolding "
+                  "(content describes an abandoned LLaVA-7B design; "
+                  "the shipped study targets SmolVLM-Instruct-4bit — see docs/DESIGN.md)")
+            print("  4-bit quantization framework")
+            print("  Single-GPU TP simulation")
+            print("  Core performance metrics")
+            print("  SLA targets")
+            print("  1-page design document")
             print("\nReady to proceed to Phase 1: Adaptive Controller Development")
             return True
         else:

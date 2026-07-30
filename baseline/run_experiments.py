@@ -6,6 +6,19 @@ Measures T_vision, T_prefill, T_decode across resolution sweeps,
 tracks KV-cache growth, memory fragmentation, and batch throughput.
 
 All results are saved to baseline/results.json for notebook consumption.
+
+SUPERSEDED by baseline/measure_v2.py / baseline/results_v2.json.
+
+This script has known methodology defects (see REVIEW_FINDINGS.md):
+the vision/decode split is a residual that never directly isolates a
+stage, `mx.eval()` is called with no arguments in places (a no-op that
+synchronizes nothing), there is no warm-up trial, percentiles are
+fabricated by copying the mean, and the resolution sweep does not
+actually vary the visual token count (the processor resizes every
+input to the same tiling under this script's settings, so its own
+data shows flat latency across "224/512/1024 px"). Do not treat
+baseline/results.json as ground truth — use baseline/results_v2.json
+and amio_constants.py instead. Retained for provenance only.
 """
 
 import sys, os, time, json, gc
