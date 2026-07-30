@@ -16,3 +16,13 @@
 - Throughput: Measured with `enforce_eager=True`; production graph-optimized modes are ~2x faster.
 - Model Context: OPT-125m results are text-only; scaling for multimodal VLMs (e.g., SmolVLM) will vary.
 - Cost Model: Coefficients are specific to T4 hardware and SDPA kernels.
+- **Reproducibility**: this report's cost-model coefficients differ from
+  the earlier `cuda_benchmark_report.md`'s (same claimed R²=0.9996, different
+  γ/β/α) — both are single live-GPU-timing runs of the same notebook cell,
+  not a stable fit; run-to-run coefficient variance was never quantified
+  (no repeated trials, no confidence interval). Treat either coefficient
+  set as illustrative, not calibrated.
+- **Scope**: this directory (T4 GPU, `facebook/opt-125m`, text-only) is a
+  standalone benchmark unrelated to the main M3/SmolVLM study in the rest
+  of this repository — it shares no hardware, model, or vision component,
+  and does not validate any AMIO claim.
