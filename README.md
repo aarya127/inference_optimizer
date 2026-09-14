@@ -188,4 +188,5 @@ scope/venv_phase0/bin/python integrated_service.py --api
 - [REVIEW_FINDINGS.md](REVIEW_FINDINGS.md) — original detailed review
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
-- [docs/INSTALL.md](docs/INSTALL.md) — environment notes
+- [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the
+  abandoned LLaVA-1.5-7B design phase; marked stale, use Quick start above

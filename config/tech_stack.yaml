@@ -1,3 +1,13 @@
+# ============================================================================
+# PARTIALLY STALE — the framework/hardware sections (MLX, M3 variants,
+# quantization formats) are still accurate. The following are NOT:
+#   - `models.supported_architectures` lists LLaVA/Qwen-VL/CLIP+LLaMA, not
+#     the SigLIP+SmolLM2-class Idefics3 checkpoint the study actually uses.
+#   - `validation` checklist item "LLaVA-1.5-7B loads in <6GB memory"
+#     describes the abandoned design phase (see docs/DESIGN.md).
+# See amio_constants.py for the current, measured ground truth.
+# ============================================================================
+
 # AMIO Phase 0 - Tech Stack Specification for Apple Silicon M3
 
 # Core Framework

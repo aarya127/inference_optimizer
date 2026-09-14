@@ -1,5 +1,16 @@
 # AMIO Phase 0 - Installation Guide
 
+> **STALE — describes an earlier, abandoned design phase.** This guide
+> targets **LLaVA-1.5-7B** on an M3 with **16GB+** unified memory, and
+> points at `models/multimodal_loader.py` as if it performed real model
+> loading (it is unused scaffolding — see that file's own header). The
+> study that was actually built and evaluated targets
+> **`mlx-community/SmolVLM-Instruct-4bit`** on an **M3 base with 8GB**
+> unified memory, and loads real models only via `mlx_vlm` (see
+> `scripts/test_model_load.py`). For working setup and run instructions,
+> use the [README's Quick start](../README.md#quick-start) instead.
+> Retained for provenance, not as current instructions.
+
 ## Prerequisites
 
 ### Hardware Requirements

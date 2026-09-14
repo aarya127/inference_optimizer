@@ -1,6 +1,9 @@
 """
 SLA Validator for AMIO Phase 0
 
+NOTE: this module is not imported by the live service
+(integrated_service.py) — it is standalone instrumentation.
+
 Validates inference metrics against defined SLA targets:
 - TTFT < 500ms (p95)
 - TBT < 50ms (mean)

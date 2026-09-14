@@ -1,0 +1,260 @@
+{
+  "meta": {
+    "model": "mlx-community/SmolVLM-Instruct-4bit",
+    "mlx_version": "0.31.0",
+    "platform": "macOS-14.6-arm64-arm-64bit",
+    "machine": "arm64",
+    "trials": 8,
+    "load_ms": 1978.0,
+    "method": "real image -> get_input_embeddings -> make_prompt_cache -> language_model prefill; crops fixed at 1 (do_image_splitting=False); text length varied to densify N coverage using the same real code path as measure_v2.py. mx.eval on actual output arrays; 1 discarded warm-up per shape (Metal kernel compile is shape-dependent)."
+  },
+  "points": [
+    {
+      "n_tokens": 101,
+      "filler_repeats": 0,
+      "lm_prefill": {
+        "mean_ms": 194.87,
+        "std_ms": 0.63,
+        "min_ms": 194.4,
+        "trials_ms": [
+          195.31,
+          194.4,
+          194.53,
+          194.62,
+          194.74,
+          196.26,
+          194.6,
+          194.52
+        ]
+      }
+    },
+    {
+      "n_tokens": 121,
+      "filler_repeats": 1,
+      "lm_prefill": {
+        "mean_ms": 200.99,
+        "std_ms": 2.65,
+        "min_ms": 196.73,
+        "trials_ms": [
+          203.24,
+          199.71,
+          196.73,
+          205.3,
+          202.06,
+          201.54,
+          199.15,
+          200.15
+        ]
+      }
+    },
+    {
+      "n_tokens": 161,
+      "filler_repeats": 3,
+      "lm_prefill": {
+        "mean_ms": 292.42,
+        "std_ms": 2.24,
+        "min_ms": 290.19,
+        "trials_ms": [
+          296.47,
+          292.55,
+          290.97,
+          293.5,
+          294.42,
+          290.77,
+          290.19,
+          290.45
+        ]
+      }
+    },
+    {
+      "n_tokens": 221,
+      "filler_repeats": 6,
+      "lm_prefill": {
+        "mean_ms": 344.03,
+        "std_ms": 1.4,
+        "min_ms": 341.99,
+        "trials_ms": [
+          341.99,
+          343.43,
+          342.93,
+          344.33,
+          346.36,
+          343.31,
+          344.5,
+          345.35
+        ]
+      }
+    },
+    {
+      "n_tokens": 301,
+      "filler_repeats": 10,
+      "lm_prefill": {
+        "mean_ms": 489.25,
+        "std_ms": 2.98,
+        "min_ms": 483.99,
+        "trials_ms": [
+          492.95,
+          488.8,
+          491.95,
+          488.52,
+          488.05,
+          492.17,
+          487.54,
+          483.99
+        ]
+      }
+    },
+    {
+      "n_tokens": 421,
+      "filler_repeats": 16,
+      "lm_prefill": {
+        "mean_ms": 677.43,
+        "std_ms": 0.51,
+        "min_ms": 677.07,
+        "trials_ms": [
+          678.64,
+          677.22,
+          677.12,
+          677.17,
+          677.07,
+          677.47,
+          677.46,
+          677.31
+        ]
+      }
+    },
+    {
+      "n_tokens": 581,
+      "filler_repeats": 24,
+      "lm_prefill": {
+        "mean_ms": 922.97,
+        "std_ms": 1.11,
+        "min_ms": 921.9,
+        "trials_ms": [
+          924.19,
+          921.9,
+          925.19,
+          922.49,
+          922.46,
+          922.44,
+          922.47,
+          922.6
+        ]
+      }
+    },
+    {
+      "n_tokens": 781,
+      "filler_repeats": 34,
+      "lm_prefill": {
+        "mean_ms": 1221.42,
+        "std_ms": 2.04,
+        "min_ms": 1219.88,
+        "trials_ms": [
+          1223.1,
+          1225.8,
+          1219.99,
+          1219.88,
+          1220.35,
+          1221.0,
+          1220.85,
+          1220.35
+        ]
+      }
+    },
+    {
+      "n_tokens": 1021,
+      "filler_repeats": 46,
+      "lm_prefill": {
+        "mean_ms": 1576.1,
+        "std_ms": 3.11,
+        "min_ms": 1572.34,
+        "trials_ms": [
+          1574.14,
+          1572.34,
+          1576.69,
+          1575.39,
+          1576.54,
+          1577.13,
+          1582.64,
+          1573.89
+        ]
+      }
+    },
+    {
+      "n_tokens": 1301,
+      "filler_repeats": 60,
+      "lm_prefill": {
+        "mean_ms": 2048.7,
+        "std_ms": 15.31,
+        "min_ms": 2032.1,
+        "trials_ms": [
+          2032.1,
+          2033.8,
+          2035.25,
+          2042.95,
+          2050.67,
+          2057.11,
+          2064.45,
+          2073.31
+        ]
+      }
+    },
+    {
+      "n_tokens": 1621,
+      "filler_repeats": 76,
+      "lm_prefill": {
+        "mean_ms": 2645.91,
+        "std_ms": 14.76,
+        "min_ms": 2620.51,
+        "trials_ms": [
+          2620.51,
+          2631.76,
+          2643.21,
+          2639.88,
+          2653.46,
+          2656.13,
+          2659.09,
+          2663.26
+        ]
+      }
+    },
+    {
+      "n_tokens": 1981,
+      "filler_repeats": 94,
+      "lm_prefill": {
+        "mean_ms": 4566.11,
+        "std_ms": 3092.71,
+        "min_ms": 3192.5,
+        "trials_ms": [
+          3302.26,
+          3298.34,
+          3401.66,
+          3776.78,
+          4168.05,
+          12175.14,
+          3214.11,
+          3192.5
+        ]
+      }
+    },
+    {
+      "n_tokens": 2381,
+      "filler_repeats": 114,
+      "lm_prefill": {
+        "mean_ms": 9038.42,
+        "std_ms": 5012.26,
+        "min_ms": 3958.31,
+        "trials_ms": [
+          4412.26,
+          5993.57,
+          16790.42,
+          10939.61,
+          3958.31,
+          7871.4,
+          15925.58,
+          6416.18
+        ]
+      }
+    }
+  ]
+}
