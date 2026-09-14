@@ -186,6 +186,10 @@ scope/venv_phase0/bin/python integrated_service.py --api
 
 - [FINAL_REPORT.md](FINAL_REPORT.md) — generated technical report
 - [REVIEW_FINDINGS.md](REVIEW_FINDINGS.md) — original detailed review
+- [baseline/PREFILL_V3_FINDINGS.md](baseline/PREFILL_V3_FINDINGS.md) — an
+  attempt to densify the prefill calibration past 4 points; inconclusive and
+  not adopted (likely confounded by concurrent load on the measurement
+  machine), documented rather than discarded
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

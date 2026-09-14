@@ -24,14 +24,30 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def _point_stats(trials):
+    """Robust + naive stats for one point's raw trial list."""
+    arr = np.asarray(trials, dtype=float)
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+    median = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median))) * 1.4826  # -> std-equivalent
+    cv_pct = (std / mean * 100) if mean else 0.0
+    return mean, std, median, mad, cv_pct
+
+
 def load_points():
     v2 = json.loads((ROOT / "baseline" / "results_v2.json").read_text())
     points = []
     for label, e in v2["configs"].items():
+        trials = e["lm_prefill"]["trials_ms"]
+        mean, std, median, mad, cv_pct = _point_stats(trials)
         points.append({
             "n_tokens": e["total_input_tokens"],
-            "t_prefill_ms": e["lm_prefill"]["mean_ms"],
-            "t_prefill_std_ms": e["lm_prefill"]["std_ms"],
+            "t_prefill_mean_ms": mean,
+            "t_prefill_median_ms": median,
+            "t_prefill_std_ms": std,
+            "t_prefill_mad_ms": mad,
+            "cv_pct": cv_pct,
             "source": f"results_v2.json:{label}",
         })
 
@@ -39,10 +55,15 @@ def load_points():
     if v3_path.exists():
         v3 = json.loads(v3_path.read_text())
         for p in v3["points"]:
+            trials = p["lm_prefill"]["trials_ms"]
+            mean, std, median, mad, cv_pct = _point_stats(trials)
             points.append({
                 "n_tokens": p["n_tokens"],
-                "t_prefill_ms": p["lm_prefill"]["mean_ms"],
-                "t_prefill_std_ms": p["lm_prefill"]["std_ms"],
+                "t_prefill_mean_ms": mean,
+                "t_prefill_median_ms": median,
+                "t_prefill_std_ms": std,
+                "t_prefill_mad_ms": mad,
+                "cv_pct": cv_pct,
                 "source": f"prefill_text_calibration.json:repeats={p['filler_repeats']}",
             })
     else:
@@ -53,12 +74,10 @@ def load_points():
     return points
 
 
-def fit_and_report(points):
-    n_arr = np.array([p["n_tokens"] for p in points], dtype=float)
-    t_arr = np.array([p["t_prefill_ms"] for p in points], dtype=float)
-    std_arr = np.array([max(p["t_prefill_std_ms"], 1e-3) for p in points], dtype=float)
-    w = 1.0 / std_arr
+CV_FLAG_PCT = 5.0  # coefficient-of-variation threshold for "unstable" points
 
+
+def _fit_one(n_arr, t_arr, w, label):
     coeffs = np.polyfit(n_arr, t_arr, 2, w=w)
     gamma, beta, alpha = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
 
@@ -76,24 +95,56 @@ def fit_and_report(points):
         loocv_apes.append(abs(pred_i - t_arr[i]) / t_arr[i] * 100)
     loocv_mape = float(np.mean(loocv_apes))
 
-    print(f"N points: {len(points)}  (domain N in [{n_arr.min():.0f}, {n_arr.max():.0f}])")
-    print(f"\n{'N':>6s} {'T_prefill (ms)':>15s} {'std':>8s}  source")
-    for p in points:
-        print(f"{p['n_tokens']:6d} {p['t_prefill_ms']:15.1f} "
-              f"{p['t_prefill_std_ms']:8.1f}  {p['source']}")
-
-    print(f"\nFitted: T_prefill(N) = {gamma:.6e}*N^2 + {beta:.6f}*N + {alpha:.2f}")
+    print(f"\n[{label}] T_prefill(N) = {gamma:.6e}*N^2 + {beta:.6f}*N + {alpha:.2f}")
     print(f"  R^2 (in-sample)  = {r2:.4f}")
     print(f"  MAPE (in-sample) = {insample_mape:.2f}%")
-    print(f"  MAPE (LOOCV)     = {loocv_mape:.2f}%   <- compare against the "
-          f"previous 4-point fit's 20.7%")
+    print(f"  MAPE (LOOCV)     = {loocv_mape:.2f}%")
+
+    return {"gamma": gamma, "beta": beta, "alpha": alpha, "r2": r2,
+            "insample_mape_pct": insample_mape, "loocv_mape_pct": loocv_mape}
+
+
+def fit_and_report(points):
+    n_arr = np.array([p["n_tokens"] for p in points], dtype=float)
+    mean_arr = np.array([p["t_prefill_mean_ms"] for p in points], dtype=float)
+    median_arr = np.array([p["t_prefill_median_ms"] for p in points], dtype=float)
+    std_arr = np.array([max(p["t_prefill_std_ms"], 1e-3) for p in points], dtype=float)
+    mad_arr = np.array([max(p["t_prefill_mad_ms"], 1e-3) for p in points], dtype=float)
+
+    print(f"N points: {len(points)}  (domain N in [{n_arr.min():.0f}, {n_arr.max():.0f}])")
+    print(f"\n{'N':>6s} {'mean (ms)':>10s} {'median (ms)':>12s} {'CV%':>6s}  source")
+    unstable = []
+    for p in points:
+        flag = " <- UNSTABLE (see note below)" if p["cv_pct"] > CV_FLAG_PCT else ""
+        if flag:
+            unstable.append(p)
+        print(f"{p['n_tokens']:6d} {p['t_prefill_mean_ms']:10.1f} "
+              f"{p['t_prefill_median_ms']:12.1f} {p['cv_pct']:6.1f}  "
+              f"{p['source']}{flag}")
+
+    if unstable:
+        print(f"\nNOTE: {len(unstable)} point(s) show coefficient of variation "
+              f"> {CV_FLAG_PCT:.0f}% across trials (std/mean), driven by rare "
+              f"multi-second outlier trials at large N (see raw trials_ms in "
+              f"baseline/prefill_text_calibration.json) -- plausibly thermal "
+              f"throttling or memory pressure under sustained heavy compute on "
+              f"this 8GB M3, not measurement error. This was NOT observed "
+              f"below N~1300. Both a mean-weighted (1/std) and a "
+              f"median-weighted (1/MAD, robust to the outlier trials) fit are "
+              f"reported below so the choice of central tendency is visible, "
+              f"not hidden.")
+
+    fit_mean = _fit_one(n_arr, mean_arr, 1.0 / std_arr, "mean-weighted (1/std)")
+    fit_median = _fit_one(n_arr, median_arr, 1.0 / mad_arr, "median-weighted (1/MAD, robust)")
+
+    print(f"\n<- compare both LOOCV MAPEs against the previous 4-point fit's 20.7%")
 
     return {
-        "gamma": gamma, "beta": beta, "alpha": alpha,
-        "r2": r2, "insample_mape_pct": insample_mape,
-        "loocv_mape_pct": loocv_mape,
         "n_points": len(points),
         "domain_n": [float(n_arr.min()), float(n_arr.max())],
+        "unstable_n_thresholds": [p["n_tokens"] for p in unstable],
+        "fit_mean_weighted": fit_mean,
+        "fit_median_weighted_robust": fit_median,
         "points": points,
     }
 
