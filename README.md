@@ -190,6 +190,11 @@ scope/venv_phase0/bin/python integrated_service.py --api
   attempt to densify the prefill calibration past 4 points; inconclusive and
   not adopted (likely confounded by concurrent load on the measurement
   machine), documented rather than discarded
+- [baseline/TIER2_LLAMACPP_FINDINGS.md](baseline/TIER2_LLAMACPP_FINDINGS.md)
+  — a second model (Qwen2.5-0.5B) on a second backend (llama.cpp/Metal)
+  validates the same quadratic cost-model form with LOOCV MAPE 5.72% (vs
+  SmolVLM/MLX's 20.7%), supporting that the 20.7% gap was a data-density
+  issue, not a modeling one
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

@@ -1,0 +1,248 @@
+{
+  "meta": {
+    "model_repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "model_file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "backend": "llama.cpp (llama-cpp-python)",
+    "gpu_backend": "Metal",
+    "llama_cpp_python_version": "0.3.35",
+    "platform": "macOS-14.6-arm64-arm-64bit",
+    "machine": "arm64",
+    "trials": 8,
+    "decode_tokens": 32,
+    "n_ctx": 4096,
+    "load_ms": 9837.4,
+    "method": "llm.eval(tokens) for prefill (synchronous, real KV-cache update); llm.reset() between trials to clear cache without reloading weights; 1 discarded warm-up trial per token count; N timed trials, mean/std/min reported."
+  },
+  "points": [
+    {
+      "n_tokens": 32,
+      "lm_prefill": {
+        "mean_ms": 18.9,
+        "std_ms": 0.13,
+        "min_ms": 18.77,
+        "trials_ms": [
+          18.87,
+          18.77,
+          18.8,
+          18.81,
+          18.96,
+          18.94,
+          18.94,
+          19.16
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 10.75,
+        "std_ms": 17.64,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 64,
+      "lm_prefill": {
+        "mean_ms": 31.18,
+        "std_ms": 0.87,
+        "min_ms": 30.55,
+        "trials_ms": [
+          30.56,
+          30.55,
+          30.59,
+          30.59,
+          30.86,
+          31.25,
+          32.39,
+          32.67
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 9.04,
+        "std_ms": 4.43,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 128,
+      "lm_prefill": {
+        "mean_ms": 55.34,
+        "std_ms": 0.39,
+        "min_ms": 54.73,
+        "trials_ms": [
+          55.22,
+          55.91,
+          55.28,
+          55.19,
+          55.88,
+          55.26,
+          55.25,
+          54.73
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 9.1,
+        "std_ms": 8.18,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 256,
+      "lm_prefill": {
+        "mean_ms": 101.98,
+        "std_ms": 0.11,
+        "min_ms": 101.87,
+        "trials_ms": [
+          102.03,
+          101.87,
+          102.22,
+          102.03,
+          101.89,
+          101.95,
+          101.91,
+          101.92
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 12.41,
+        "std_ms": 20.96,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 384,
+      "lm_prefill": {
+        "mean_ms": 159.16,
+        "std_ms": 1.07,
+        "min_ms": 157.49,
+        "trials_ms": [
+          161.42,
+          157.49,
+          158.77,
+          159.17,
+          159.19,
+          159.04,
+          159.11,
+          159.12
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 12.69,
+        "std_ms": 26.82,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 512,
+      "lm_prefill": {
+        "mean_ms": 210.28,
+        "std_ms": 0.09,
+        "min_ms": 210.18,
+        "trials_ms": [
+          210.41,
+          210.26,
+          210.18,
+          210.4,
+          210.2,
+          210.23,
+          210.24,
+          210.32
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 14.76,
+        "std_ms": 35.83,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 768,
+      "lm_prefill": {
+        "mean_ms": 321.99,
+        "std_ms": 0.6,
+        "min_ms": 321.35,
+        "trials_ms": [
+          321.96,
+          321.67,
+          321.95,
+          322.52,
+          321.35,
+          321.82,
+          321.48,
+          323.19
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 11.96,
+        "std_ms": 18.33,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 1024,
+      "lm_prefill": {
+        "mean_ms": 444.18,
+        "std_ms": 7.59,
+        "min_ms": 438.51,
+        "trials_ms": [
+          438.51,
+          438.61,
+          456.05,
+          451.84,
+          439.26,
+          438.83,
+          438.62,
+          451.72
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 15.96,
+        "std_ms": 39.29,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 1536,
+      "lm_prefill": {
+        "mean_ms": 686.7,
+        "std_ms": 1.08,
+        "min_ms": 685.58,
+        "trials_ms": [
+          688.11,
+          688.33,
+          687.17,
+          686.21,
+          685.83,
+          685.7,
+          685.58,
+          686.63
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 17.67,
+        "std_ms": 43.87,
+        "n_tokens_generated": 32
+      }
+    },
+    {
+      "n_tokens": 2048,
+      "lm_prefill": {
+        "mean_ms": 959.67,
+        "std_ms": 9.75,
+        "min_ms": 952.34,
+        "trials_ms": [
+          955.27,
+          979.39,
+          969.74,
+          958.65,
+          952.34,
+          955.79,
+          953.11,
+          953.09
+        ]
+      },
+      "decode_tbt": {
+        "mean_ms": 18.39,
+        "std_ms": 45.43,
+        "n_tokens_generated": 32
+      }
+    }
+  ]
+}

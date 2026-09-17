@@ -40,6 +40,11 @@ import numpy as np
 
 MODEL_REPO = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
 MODEL_FILE = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+# Downloaded via curl (see repo notes), not huggingface_hub's hf_hub_download:
+# that downloader has no read-timeout and hung indefinitely on a dead
+# connection (TCP CLOSE_WAIT, zero progress) during this project's own
+# download. curl with --speed-time/--speed-limit aborts and retries instead.
+LOCAL_MODEL_PATH = Path.home() / ".cache" / "inference_optimizer_models" / MODEL_FILE
 
 # Token counts to test. A 0.5B model at Q4 is cheap enough per-token that we
 # can span a wide range without the multi-second-per-trial cost that limited
@@ -101,12 +106,17 @@ def main():
     ap.add_argument("--n-ctx", type=int, default=4096)
     args = ap.parse_args()
 
-    from huggingface_hub import hf_hub_download
     from llama_cpp import Llama
     import llama_cpp
 
-    print(f"[download] {MODEL_REPO}/{MODEL_FILE}")
-    model_path = hf_hub_download(MODEL_REPO, MODEL_FILE)
+    if not LOCAL_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"{LOCAL_MODEL_PATH} not found. Download it first, e.g.:\n"
+            f"  curl -L --retry 5 --retry-delay 3 --connect-timeout 15 "
+            f"--speed-time 20 --speed-limit 1000 -o {LOCAL_MODEL_PATH} \\\n"
+            f'    "https://huggingface.co/{MODEL_REPO}/resolve/main/{MODEL_FILE}"'
+        )
+    model_path = str(LOCAL_MODEL_PATH)
 
     print(f"[load] {model_path}")
     t0 = _now_ms()
