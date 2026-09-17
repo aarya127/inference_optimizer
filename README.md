@@ -84,6 +84,10 @@ core/
                                    ConcurrencyThroughputTechnique
                                    (last one MODELED batch scaling, not
                                    measured -- see core/README.md)
+  executor.py, executors/         Real execution: recommend -> run for
+                                   real -> compare predicted vs measured
+                                   (Tier 4) -- see core/TIER4_CLOSED_LOOP_FINDINGS.md
+  optimize.py                     CLI: closed-loop recommend+execute+verify
 simulation/
   controller.py                    48-strategy adaptive controller
   resolution_scaler.py             Four real crop settings
@@ -214,6 +218,11 @@ scope/venv_phase0/bin/python integrated_service.py --api
 - [core/README.md](core/README.md) — the Technique abstraction: one
   interface, run against two real calibrated (model, backend) profiles,
   with genuinely different applicability and recommendations per profile
+- [core/TIER4_CLOSED_LOOP_FINDINGS.md](core/TIER4_CLOSED_LOOP_FINDINGS.md)
+  — recommend, execute for real, compare predicted vs measured: Qwen/
+  llama.cpp validated to 0.5%, but SmolVLM/MLX was off by 41-72% against a
+  fresh real run despite R²=0.9996 in-sample -- a genuine, reproducible
+  finding, not smoothed over
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

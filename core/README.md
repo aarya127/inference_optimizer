@@ -60,10 +60,42 @@ scope/venv_phase0/bin/python -m core.demo
 scope/venv_phase0/bin/python -m pytest tests/test_core.py -v
 ```
 
+## Tier 4: closing the loop (recommend → execute → verify)
+
+`core/executor.py` + `core/executors/` add real execution: given a
+Technique's recommendation, actually run it through the real backend
+(`LlamaCppExecutor` loads the real recommended GGUF quant level and runs a
+real `llm.eval()`; `MLXExecutor` runs a real image through the real vision
+encoder + LM prefill) and compare MEASURED latency against the cost
+model's PREDICTED value — not just against the historical LOOCV score.
+
+```bash
+scope/venv_phase0/bin/python -m core.optimize --profile qwen_llamacpp --sla-ms 500
+scope/venv_phase0/bin/python -m core.optimize --profile smolvlm_mlx --sla-ms 500
+```
+
+This caught two things LOOCV alone would not have: (1) a recommendation
+sitting exactly at the SLA boundary is fragile to real-world variance —
+Qwen's recommendation predicted 500.1ms, measured 502.8ms, and technically
+missed the SLA despite only 0.5% prediction error; (2) SmolVLM/MLX's cost
+model, despite R²=0.9996 in-sample, is off by 41-72% against a fresh real
+execution — reproducibly, and in the same direction as
+`baseline/PREFILL_V3_FINDINGS.md`'s earlier session-dependent finding. See
+`TIER4_CLOSED_LOOP_FINDINGS.md` for the full writeup. Deliberately not
+"fixed" — this is reported as a finding about this profile's real-world
+reliability, not smoothed over.
+
+Executors are standalone (not wrapped in `tests/test_core.py`), matching
+this repo's convention of keeping real, slow, model-loading measurements as
+runnable scripts rather than part of the fast pytest suite.
+
 ## What this is not (yet)
 
-This is a proof of the abstraction on two profiles and two techniques —
-not a general driver that loads arbitrary HuggingFace/GGUF models and
-auto-calibrates them. Extending it further (more techniques, an
-auto-calibration pipeline instead of hand-run scripts, more profiles)
-is future work; see the main README's roadmap.
+This is a proof of the abstraction on two profiles, four techniques, and
+two executors — not a general driver that loads arbitrary HuggingFace/GGUF
+models and auto-calibrates them, and not a production autotuner (no safety
+margins, no automatic recalibration when a closed-loop check disagrees
+with the cost model). Extending it further (more techniques, an
+auto-calibration pipeline instead of hand-run scripts, more profiles, a
+safety-margin-aware PrefillBudgetTechnique) is future work; see the main
+README's roadmap.
