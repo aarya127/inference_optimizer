@@ -37,6 +37,21 @@ they're the only two techniques worth having:
 - `QuantizationLevelTechnique` — applies to `qwen_llamacpp` (three
   measured levels) but *not* to `smolvlm_mlx` (no such data exists) —
   the interface reports "not applicable" rather than guessing.
+- `KVCacheBudgetTechnique` — max context length per sequence under a
+  memory budget, from each profile's real `kv_bytes_per_token` (derived
+  from actual checkpoint architecture: layers, KV heads, head dim, dtype).
+  Applies to both profiles, and the real 16x difference between them
+  (SmolVLM: 196,608 B/token, full MHA, 32 KV heads; Qwen2.5-0.5B: 12,288
+  B/token, GQA, 2 KV heads) produces a genuinely different answer — e.g.
+  10,923 vs 174,763 max context tokens under the same 2 GiB budget.
+- `ConcurrencyThroughputTechnique` — max concurrent sequences under a
+  decode (TBT) SLA. Explicitly labeled MODELED, not measured: every decode
+  measurement in this repo is batch=1 only, so this extends the measured
+  batch=1 `DecodeCostModel` with the same per-extra-sequence KV-read term
+  `amio_constants.py` already documents for SmolVLM (~3.0ms/extra sequence
+  at 1548 ctx), generalized to any profile's real `kv_bytes_per_token` and
+  `bandwidth_gbps` — applied to both profiles with the same honest label,
+  not asserted as a measurement for either.
 
 ## Usage
 

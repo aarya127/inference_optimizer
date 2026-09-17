@@ -79,7 +79,11 @@ core/
                                    Technique interface (Tier 3) — see
                                    core/README.md
   techniques/                     PrefillBudgetTechnique,
-                                   QuantizationLevelTechnique
+                                   QuantizationLevelTechnique,
+                                   KVCacheBudgetTechnique,
+                                   ConcurrencyThroughputTechnique
+                                   (last one MODELED batch scaling, not
+                                   measured -- see core/README.md)
 simulation/
   controller.py                    48-strategy adaptive controller
   resolution_scaler.py             Four real crop settings

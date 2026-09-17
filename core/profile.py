@@ -87,6 +87,10 @@ class ModelHardwareProfile:
     # this (model, backend) pair -- absent, not fabricated, otherwise.
     quant_levels: Optional[Dict[str, QuantLevelStats]] = None
     supports_vision: bool = False
+    # KV cache bytes/token = 2(K+V) * layers * kv_heads * head_dim * dtype_bytes,
+    # derived from the checkpoint's real config.json -- never fabricated.
+    kv_bytes_per_token: Optional[float] = None
+    bandwidth_gbps: Optional[float] = None
 
 
 def load_smolvlm_mlx_profile() -> ModelHardwareProfile:
@@ -113,7 +117,26 @@ def load_smolvlm_mlx_profile() -> ModelHardwareProfile:
         ),
         quant_levels=None,
         supports_vision=True,
+        kv_bytes_per_token=C.KV_BYTES_PER_TOKEN_FP16,
+        bandwidth_gbps=C.M3_MEMORY_BW_GBPS,
     )
+
+
+# Qwen2.5-0.5B-Instruct architecture, verified from the real checkpoint
+# config.json (huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/raw/main/config.json),
+# not guessed: hidden_size=896, num_attention_heads=14 (head_dim=64),
+# num_hidden_layers=24, num_key_value_heads=2 (GQA -- 7x fewer KV heads than
+# attention heads). llama.cpp's default KV cache dtype is F16 (2 bytes);
+# measure_llamacpp.py / measure_quantization_tradeoff.py did not override
+# type_k/type_v, so this is what those measurements actually used.
+QWEN25_05B_NUM_LAYERS = 24
+QWEN25_05B_NUM_KV_HEADS = 2
+QWEN25_05B_HEAD_DIM = 64
+QWEN25_05B_KV_DTYPE_BYTES = 2
+QWEN25_05B_KV_BYTES_PER_TOKEN = (
+    2 * QWEN25_05B_NUM_LAYERS * QWEN25_05B_NUM_KV_HEADS
+    * QWEN25_05B_HEAD_DIM * QWEN25_05B_KV_DTYPE_BYTES
+)  # = 12,288 B/token -- 16x smaller than SmolVLM's 196,608 (smaller model + GQA)
 
 
 def load_qwen_llamacpp_profile() -> ModelHardwareProfile:
@@ -156,6 +179,8 @@ def load_qwen_llamacpp_profile() -> ModelHardwareProfile:
         ),
         quant_levels=quant_levels,
         supports_vision=False,
+        kv_bytes_per_token=QWEN25_05B_KV_BYTES_PER_TOKEN,
+        bandwidth_gbps=100.0,  # same M3 unified-memory bandwidth as the MLX profile
     )
 
 

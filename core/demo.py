@@ -8,13 +8,16 @@ Usage:
 """
 
 from core.profile import load_all_profiles
+from core.techniques.concurrency_throughput import ConcurrencyThroughputTechnique
+from core.techniques.kv_cache_budget import KVCacheBudgetTechnique
 from core.techniques.prefill_budget import PrefillBudgetTechnique
 from core.techniques.quantization_level import QuantizationLevelTechnique
 
 
 def main():
     profiles = load_all_profiles()
-    techniques = [PrefillBudgetTechnique(), QuantizationLevelTechnique()]
+    techniques = [PrefillBudgetTechnique(), QuantizationLevelTechnique(),
+                  KVCacheBudgetTechnique(), ConcurrencyThroughputTechnique()]
 
     for profile_name, profile in profiles.items():
         print(f"\n{'=' * 70}")
@@ -33,6 +36,14 @@ def main():
                 print(f"  max_file_size_mb=700 -> {rec.rationale}")
                 rec = tech.recommend(profile, max_perplexity=15.0)
                 print(f"  max_perplexity=15.0 -> {rec.rationale}")
+            elif tech.name == "kv_cache_budget":
+                for n_seq in (1, 8):
+                    rec = tech.recommend(profile, memory_budget_mb=2048.0,
+                                          n_concurrent_sequences=n_seq)
+                    print(f"  budget=2048MiB, n_seq={n_seq} -> {rec.rationale}")
+            elif tech.name == "concurrency_throughput":
+                rec = tech.recommend(profile, tbt_sla_ms=50.0, ctx_tokens=1024.0)
+                print(f"  tbt_sla=50ms, ctx=1024 -> {rec.rationale}")
 
 
 if __name__ == "__main__":

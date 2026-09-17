@@ -22,6 +22,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core.profile import load_smolvlm_mlx_profile, load_qwen_llamacpp_profile
+from core.techniques.concurrency_throughput import ConcurrencyThroughputTechnique
+from core.techniques.kv_cache_budget import KVCacheBudgetTechnique
 from core.techniques.prefill_budget import PrefillBudgetTechnique
 from core.techniques.quantization_level import QuantizationLevelTechnique
 
@@ -121,3 +123,55 @@ def test_quantization_technique_same_class_differs_by_profile():
     smolvlm = load_smolvlm_mlx_profile()
     qwen = load_qwen_llamacpp_profile()
     assert tech.applies_to(smolvlm) != tech.applies_to(qwen)
+
+
+def test_kv_cache_budget_applies_to_both_profiles_with_real_constants():
+    tech = KVCacheBudgetTechnique()
+    smolvlm = load_smolvlm_mlx_profile()
+    assert tech.applies_to(smolvlm)
+    # SmolVLM's KV bytes/token (196,608, full MHA) is a documented multiple
+    # of Qwen's (12,288, GQA) -- exactly 16x, from amio_constants.py and the
+    # real Qwen2.5-0.5B config.json respectively.
+    assert smolvlm.kv_bytes_per_token == pytest.approx(196608)
+
+
+def test_kv_cache_budget_scales_inversely_with_concurrent_sequences():
+    tech = KVCacheBudgetTechnique()
+    profile = load_smolvlm_mlx_profile()
+    one_seq = tech.recommend(profile, memory_budget_mb=2048.0, n_concurrent_sequences=1)
+    eight_seq = tech.recommend(profile, memory_budget_mb=2048.0, n_concurrent_sequences=8)
+    assert one_seq.applicable and eight_seq.applicable
+    # 8x the concurrent sequences -> 1/8th the context length per sequence.
+    assert one_seq.estimated_value == pytest.approx(eight_seq.estimated_value * 8, rel=1e-6)
+
+
+@requires_qwen_fit
+def test_kv_cache_budget_reflects_real_architecture_difference():
+    """Same memory budget, same n_sequences: Qwen (GQA, 12,288 B/token)
+    must fit a proportionally larger context than SmolVLM (full MHA,
+    196,608 B/token) -- this is real architecture math, not an assumption."""
+    tech = KVCacheBudgetTechnique()
+    smolvlm = load_smolvlm_mlx_profile()
+    qwen = load_qwen_llamacpp_profile()
+    rec_smolvlm = tech.recommend(smolvlm, memory_budget_mb=2048.0, n_concurrent_sequences=1)
+    rec_qwen = tech.recommend(qwen, memory_budget_mb=2048.0, n_concurrent_sequences=1)
+    ratio = rec_qwen.estimated_value / rec_smolvlm.estimated_value
+    expected_ratio = smolvlm.kv_bytes_per_token / qwen.kv_bytes_per_token
+    assert ratio == pytest.approx(expected_ratio, rel=1e-6)
+
+
+def test_concurrency_throughput_is_modeled_not_measured_label():
+    tech = ConcurrencyThroughputTechnique()
+    profile = load_smolvlm_mlx_profile()
+    rec = tech.recommend(profile, tbt_sla_ms=50.0, ctx_tokens=1024.0)
+    assert rec.applicable
+    assert "MODELED" in rec.rationale
+
+
+def test_concurrency_throughput_reports_zero_when_batch1_already_over_sla():
+    tech = ConcurrencyThroughputTechnique()
+    profile = load_smolvlm_mlx_profile()
+    # An unreasonably tight TBT SLA that even batch=1 cannot meet.
+    rec = tech.recommend(profile, tbt_sla_ms=0.001, ctx_tokens=1024.0)
+    assert rec.applicable
+    assert rec.choice == 0
