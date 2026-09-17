@@ -68,8 +68,18 @@ comparisons remain modeled.
 ```text
 baseline/
   measure_v2.py, results_v2.json   Corrected MLX measurement campaign
+  measure_llamacpp.py              Second model+backend: Qwen2.5-0.5B/llama.cpp
+  measure_quantization_tradeoff.py Real fp16/Q8_0/Q4_K_M measurement (size,
+                                   speed, perplexity)
 model_calibration/
   cost_model.py                    Measured fit + modeled extensions
+  fit_llamacpp_prefill.py          Cost-model fit for the llama.cpp profile
+core/
+  profile.py, technique.py         Per-(model,backend) profiles + the
+                                   Technique interface (Tier 3) — see
+                                   core/README.md
+  techniques/                     PrefillBudgetTechnique,
+                                   QuantizationLevelTechnique
 simulation/
   controller.py                    48-strategy adaptive controller
   resolution_scaler.py             Four real crop settings
@@ -194,7 +204,12 @@ scope/venv_phase0/bin/python integrated_service.py --api
   — a second model (Qwen2.5-0.5B) on a second backend (llama.cpp/Metal)
   validates the same quadratic cost-model form with LOOCV MAPE 5.72% (vs
   SmolVLM/MLX's 20.7%), supporting that the 20.7% gap was a data-density
-  issue, not a modeling one
+  issue, not a modeling one; also a real, measured fp16/Q8_0/Q4_K_M
+  quantization tradeoff (size, speed, perplexity) replacing this study's
+  earlier fabricated quantization claims
+- [core/README.md](core/README.md) — the Technique abstraction: one
+  interface, run against two real calibrated (model, backend) profiles,
+  with genuinely different applicability and recommendations per profile
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

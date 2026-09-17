@@ -63,6 +63,42 @@ is memory-bandwidth-bound and roughly flat, not the binding constraint:
    *technique* comparison (e.g. GGUF quant levels: Q4_K_M vs Q8_0) and to a
    second VLM would strengthen this further.
 
+## Quantization-level tradeoff (real, measured)
+
+A second, complementary Tier-2 check: does a *technique* — not just the
+measurement methodology — transfer, and can it be measured honestly rather
+than asserted? The original study's REVIEW_FINDINGS.md flagged that every
+quantization "result" in that study was fabricated (a manufactured 2x FP8
+speedup with no such GPU path on Apple Silicon; W4A8 applied on top of a
+baseline that was already 4-bit, double-counting the same compression
+twice). This repeats the comparison for real: Qwen2.5-0.5B-Instruct, three
+real GGUF quantization levels (fp16, Q8_0, Q4_K_M), same backend
+(llama.cpp/Metal), each measured for file size, prefill speed, decode
+speed, and a real perplexity proxy (manual log-softmax over raw
+per-position logits — see `baseline/measure_quantization_tradeoff.py` for
+why the high-level `create_completion(echo=True, logprobs=1)` API was
+tried and rejected: it returned 569 "token" logprobs for a 23-token
+sentence, an unexplained discrepancy not worth trusting).
+
+| level | size (MiB) | perplexity | prefill@1024 (ms) | decode TBT (ms) |
+|---|---|---|---|---|
+| fp16 | 1207.8 | 11.93 | 703.9 | 17.8 |
+| q8_0 | 644.4 | 11.89 | 683.0 | 12.3 |
+| q4_k_m | 468.6 | 12.59 | 658.4 | 10.1 |
+
+Real mechanism, not a fabricated one: prefill (compute-bound) speeds up
+only modestly (~6.5%, fp16→q4_k_m), while decode (memory-bandwidth-bound)
+speeds up substantially (~43%) because lower-precision weights move less
+data per token — this is why the original study's claim of a uniform ~2x
+GEMM speedup from quantization was never physically plausible on this
+hardware. Quality cost, measured rather than asserted: perplexity rises
+only ~5.5% relative (11.93→12.59) on the fixed reference passage from fp16
+to Q4_K_M, on this one model and one passage (not a task-accuracy
+benchmark — same caveat as the rest of this repo's "quality" numbers).
+
+This data backs `core/techniques/quantization_level.py`'s
+`QuantizationLevelTechnique` (see `core/README.md`).
+
 ## Reproduction
 
 ```bash
@@ -76,4 +112,16 @@ curl -L -C - --retry 20 --retry-delay 3 --connect-timeout 15 \
 
 scope/venv_phase0/bin/python baseline/measure_llamacpp.py --trials 8
 scope/venv_phase0/bin/python model_calibration/fit_llamacpp_prefill.py
+
+# Quantization tradeoff (downloads fp16 + q8_0; q4_k_m reused from above):
+curl -L -C - --retry 20 --retry-delay 3 --connect-timeout 15 \
+  --speed-time 15 --speed-limit 500 \
+  -o ~/.cache/inference_optimizer_models/qwen2.5-0.5b-instruct-fp16.gguf \
+  "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-fp16.gguf"
+curl -L -C - --retry 20 --retry-delay 3 --connect-timeout 15 \
+  --speed-time 15 --speed-limit 500 \
+  -o ~/.cache/inference_optimizer_models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"
+
+scope/venv_phase0/bin/python baseline/measure_quantization_tradeoff.py --trials 8
 ```
