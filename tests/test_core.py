@@ -73,6 +73,28 @@ def test_prefill_budget_is_monotonic_in_sla():
         assert large.choice >= small.choice
 
 
+def test_prefill_budget_default_margin_is_profiles_own_loocv():
+    """Added after core/TIER4_CLOSED_LOOP_FINDINGS.md: a boundary-exact
+    recommendation is fragile (Qwen missed a 500ms SLA by 2.8ms despite
+    0.5% prediction error). Default margin should equal the profile's own
+    LOOCV MAPE, not a fabricated constant, and must produce <= the
+    zero-margin token count."""
+    profile = load_smolvlm_mlx_profile()
+    tech = PrefillBudgetTechnique()
+
+    no_margin = tech.recommend(profile, sla_ms=500.0, safety_margin_pct=0.0)
+    default_margin = tech.recommend(profile, sla_ms=500.0)
+    assert f"{profile.prefill.loocv_mape_pct:.1f}% safety margin" in default_margin.rationale
+    assert default_margin.choice <= no_margin.choice
+
+
+def test_prefill_budget_rejects_invalid_margin():
+    profile = load_smolvlm_mlx_profile()
+    tech = PrefillBudgetTechnique()
+    rec = tech.recommend(profile, sla_ms=500.0, safety_margin_pct=100.0)
+    assert rec.applicable and rec.choice is None
+
+
 def test_prefill_budget_reports_out_of_domain_extrapolation():
     profile = load_smolvlm_mlx_profile()
     tech = PrefillBudgetTechnique()

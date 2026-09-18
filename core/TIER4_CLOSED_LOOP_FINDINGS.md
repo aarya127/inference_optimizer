@@ -68,6 +68,39 @@ vs. 10 points from one clean session — and this result is further
 evidence that data density and measurement-condition stability matter
 more than which functional form is used.
 
+## Follow-up: a safety margin, derived honestly, fixes Qwen's failure mode
+
+`PrefillBudgetTechnique.recommend()` now defaults `safety_margin_pct` to
+the profile's own `loocv_mape_pct` — not a new invented constant, the
+already-measured estimate of how far off each profile's predictions run.
+Re-running the closed loop:
+
+**Qwen/llama.cpp** (5.7% margin -> effective budget 471.4ms instead of
+500ms): recommended N drops from 1151 to 1092 tokens. Real run: predicted
+471.6ms, **measured 486.9ms — now comfortably under the 500ms SLA**
+(previously missed it at 502.8ms with zero margin). The margin fixed
+exactly the failure mode it targets: an accurate model whose boundary-exact
+recommendation left no headroom.
+
+**SmolVLM/MLX** (20.7% margin -> effective budget 396.5ms): recommended N
+drops from 180 to 113 tokens. Real run: predicted 407.8ms, measured
+196.0ms — the SLA is met, but **not because the margin closed the gap**.
+Prediction error is actually *larger* in relative terms here (108%) than
+at N=180 (72%), and the SLA passes only because this profile's real-world
+error happens to run in the conservative direction (real faster than
+predicted) at both N tested so far. A 20.7% margin cannot compensate for
+an error of this magnitude regardless of direction; if the error ran the
+other way (real slower than predicted) instead, the same margin would not
+have been remotely sufficient. This is not cherry-picked to make the
+margin look good or bad — it is the actual result, reported as-is.
+
+**Conclusion holds and sharpens:** a margin derived from a profile's own
+LOOCV is a real, correct fix for boundary fragility on a well-calibrated
+profile (Qwen). It is not, and cannot be, a substitute for the profile
+itself being reliable (SmolVLM) — no downstream technique can safety-margin
+its way out of a cost model whose real generalization error exceeds what
+its own validation metric reported.
+
 ## Practical implication for the "universal tool" vision
 
 A recommendation engine that only trusts its own calibration (LOOCV) can
@@ -78,10 +111,12 @@ periodically, not assume a one-time calibration stays valid indefinitely.
 
 ## What this does not (yet) do
 
-- No safety-margin logic in `PrefillBudgetTechnique` itself (the Qwen
-  finding above suggests it should have one).
 - No automatic recalibration when a closed-loop check disagrees with the
-  cost model by more than some threshold.
+  cost model by more than some threshold -- the margin added above is a
+  static, LOOCV-derived buffer, not a response to live closed-loop
+  results. A more thorough version would tighten or widen the margin based
+  on this file's own findings, rather than a human reading them and
+  updating the default by hand.
 - `MLXExecutor`'s text-length search lands close to, not exactly at, the
   requested N (tokenizer granularity) -- reported honestly in
   `ExecutionResult.note`, not silently rounded.
