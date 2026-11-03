@@ -1,0 +1,98 @@
+{
+  "model_id": "mlx-community/SmolVLM-256M-Instruct-4bit",
+  "backend": "mlx",
+  "hardware": "Apple M3 base (10-core GPU, 8GB unified, 100GB/s)",
+  "supports_vision": true,
+  "architecture": {
+    "source_config_url": "https://huggingface.co/mlx-community/SmolVLM-256M-Instruct-4bit/raw/main/config.json",
+    "nested_under_text_config": true,
+    "hidden_size": 576,
+    "num_layers": 30,
+    "num_attention_heads": 9,
+    "num_kv_heads": 3,
+    "head_dim": 64,
+    "kv_dtype_bytes": 2,
+    "kv_bytes_per_token": 23040,
+    "uses_gqa": true
+  },
+  "kv_bytes_per_token": 23040,
+  "bandwidth_gbps": 100.0,
+  "prefill": {
+    "gamma": 1.704337253255991e-05,
+    "beta": 0.1234597892119697,
+    "alpha": 6.253288652803555,
+    "r2": 0.9994856315522759,
+    "insample_mape_pct": 4.011361437028272,
+    "loocv_mape_pct": 7.526639830424459,
+    "loocv_max_ape_pct": 37.925448066598406,
+    "domain_n": [
+      80.0,
+      2060.0
+    ],
+    "n_points": 10,
+    "points": [
+      {
+        "n_tokens": 80,
+        "mean_ms": 18.163708359003067,
+        "std_ms": 2.753167235689208
+      },
+      {
+        "n_tokens": 80,
+        "mean_ms": 15.394562385976315,
+        "std_ms": 0.3520491470203099
+      },
+      {
+        "n_tokens": 140,
+        "mean_ms": 25.857827872037888,
+        "std_ms": 2.189405585099252
+      },
+      {
+        "n_tokens": 260,
+        "mean_ms": 44.76844274997711,
+        "std_ms": 1.3993791107145603
+      },
+      {
+        "n_tokens": 400,
+        "mean_ms": 58.692213356494904,
+        "std_ms": 1.2600696062402945
+      },
+      {
+        "n_tokens": 520,
+        "mean_ms": 76.49227085709572,
+        "std_ms": 0.4892005650631971
+      },
+      {
+        "n_tokens": 780,
+        "mean_ms": 113.41189075261354,
+        "std_ms": 0.21498856018402962
+      },
+      {
+        "n_tokens": 1040,
+        "mean_ms": 152.54212474822998,
+        "std_ms": 0.18103955018113888
+      },
+      {
+        "n_tokens": 1540,
+        "mean_ms": 237.50992713868618,
+        "std_ms": 0.5724738860616088
+      },
+      {
+        "n_tokens": 2060,
+        "mean_ms": 336.5272707566619,
+        "std_ms": 1.838072708675168
+      }
+    ]
+  },
+  "decode": {
+    "overhead_ms": 3.8924015957862137,
+    "per_ctx_token_ms": 0.0,
+    "raw_fit_overhead_ms": 3.941171504608326,
+    "raw_fit_per_ctx_token_ms": -0.0002540099417818389,
+    "domain_ctx": [
+      80.0,
+      400.0
+    ],
+    "clamped_negative_slope": true
+  },
+  "calibration_method": "crops=1 (do_image_splitting=False, ~100 real image tokens via a synthetic seeded image), text length varied to reach each target N -- same method as baseline/measure_prefill_text_calibration.py"
+}

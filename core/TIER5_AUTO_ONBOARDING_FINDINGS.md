@@ -132,6 +132,51 @@ before/after numbers. Summary:
   verified directly against a reproduction of the original scenario in
   `tests/test_core.py::test_fit_decode_linear_clamps_negative_slope`.
 
+## Third proof: the vision side generalizes too
+
+`core/calibrate_mlx_vlm.py` extends the automated approach to
+vision-language models, reusing `fetch_architecture` after generalizing it
+to handle the nested `text_config` vision-language configs use (SmolVLM's
+real LM architecture lives under `config["text_config"]`, not at the top
+level like a plain text model) — one shared function, no duplication, now
+confirmed against both schema shapes. The real-call measurement reuses the
+exact methodology already proven in `core/executors/mlx_executor.py` and
+the Tier-1 densification script: crops fixed at 1 (~70-100 real image
+tokens via a synthetic seeded image), text length varied to reach each
+target N.
+
+Calibrated `mlx-community/SmolVLM-256M-Instruct-4bit` — same Idefics3
+family as `smolvlm_mlx`, but a genuinely different, much smaller LM
+backbone (hidden_size=576, 30 layers, 3 KV heads/GQA vs the original's
+larger SmolLM2-1.7B-class one; `kv_bytes_per_token` comes out to 23,040,
+between SmolLM2-360M's 40,960 and Qwen's 12,288):
+
+| | smolvlm_mlx (original, hand-built) | smolvlm_256m_mlx_profile (auto) |
+|---|---|---|
+| points | 4 | 10 (two landed on the same floor N=80 — see below) |
+| LOOCV mean / max | 20.7% / 59.9% | 7.53% / 37.93% |
+| R² (in-sample) | 0.9996 | 0.9995 |
+
+The smaller, auto-calibrated model again validates better than the
+original hand-built one — consistent with every prior comparison in this
+file: more points, cleaner conditions, better validation, independent of
+model or backend.
+
+**Closed-loop result**: `MLXExecutor` — written originally for the ~2B
+`smolvlm_mlx` and never modified for this — correctly loaded and ran a
+real prefill for this completely different model via `profile.model_id`.
+Predicted 313.7ms, measured 317.8ms (**1.3% error**), comfortably under
+the 500ms SLA with its 37.9% margin.
+
+**A real quirk, disclosed not hidden**: this model's tokenization floor at
+crops=1 is higher than the smallest two target token counts (32, 64) —
+both searches landed on the same actual N=80, since the fixed image +
+chat-template overhead alone exceeds those targets. The calibration still
+ran (duplicate x-values don't break the quadratic fit), but this is
+effectively a 9-point sweep with one point measured twice, not a full
+10-point spread. `core/calibrate_mlx_vlm.py` does not currently detect or
+warn about this.
+
 ## What this still doesn't do
 
 - Only handles llama.cpp-backed models. An equivalent generic pipeline for

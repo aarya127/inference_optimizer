@@ -34,6 +34,13 @@ invented number:
   version of the same model). A genuine same-model, cross-backend
   comparison; `kv_bytes_per_token` comes out identical (12,288) on both
   backends, as it should for the same real architecture.
+- `smolvlm_256m_mlx_profile` — SmolVLM-256M-Instruct, same Idefics3 family
+  as `smolvlm_mlx` but a much smaller LM backbone, auto-calibrated by
+  `core/calibrate_mlx_vlm.py` (LOOCV mean 7.53%/max 37.93%, validating
+  better than the original hand-built profile). Proves the vision side of
+  Tier 5 generalizes too — `MLXExecutor` (originally written only for the
+  2B `smolvlm_mlx`) ran a real closed-loop check against this model
+  unmodified, 1.3% prediction error.
 
 A `Technique` declares `applies_to(profile)` and `recommend(profile, ...)`.
 Two are implemented, chosen specifically because they demonstrate
@@ -154,6 +161,34 @@ unphysical negative slope from only 5 narrow-range calibration points —
 (flat model) and keeps the raw, unclamped fit alongside it for
 transparency. Both fixes and their before/after numbers are recorded in
 `TIER5_AUTO_ONBOARDING_FINDINGS.md` and `TIER4_CLOSED_LOOP_FINDINGS.md`.
+
+`core/calibrate_mlx_vlm.py` extends the same approach to vision-language
+models, reusing `fetch_architecture` after generalizing it to read the
+nested `text_config` VLM checkpoints use for their LM architecture (one
+shared function now confirmed against both schema shapes, not a
+VLM-specific duplicate). Calibrated SmolVLM-256M-Instruct — same Idefics3
+family as `smolvlm_mlx` but a much smaller LM backbone — and the existing
+`MLXExecutor` (written only for the original 2B model) ran a real
+closed-loop check against it with **zero modification**, 1.3% prediction
+error. Confirms Tier 5's automation covers vision models too, not just
+text. Full detail in `TIER5_AUTO_ONBOARDING_FINDINGS.md`.
+
+## Tier 6: real concurrency measurement exposes a bad model
+
+`ConcurrencyThroughputTechnique` had never been checked against a real
+multi-sequence run — it was a MODELED extension of batch=1 decode data
+from day one. `baseline/measure_llamacpp_concurrency.py` measures real
+concurrent-decode throughput (B independent llama.cpp contexts, Python
+threads, SmolLM2-360M) and compares it against the technique's prediction
+for the same B and context length. Result: the technique is **substantially
+too optimistic** — it predicts near-flat TBT scaling (11.5ms → 11.8ms from
+B=1 to B=4, since it only models KV-bandwidth contention) while the real
+measurement showed close to linear degradation (~27ms at B=4, 2.3x worse
+than predicted), most likely from GIL or GPU-command-queue serialization
+the model doesn't account for. Not recalibrated to this one data point —
+the technique's docstring and `core/TIER6_REAL_CONCURRENCY_FINDINGS.md`
+now say plainly to treat its output as an optimistic lower bound, not an
+estimate, until validated for a given real deployment.
 
 ## What this is not (yet)
 

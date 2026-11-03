@@ -50,25 +50,40 @@ def _now_ms() -> float:
 
 
 def fetch_architecture(base_config_repo: str) -> dict:
-    """Pull the REAL config.json for the base (non-GGUF) checkpoint and
-    derive KV bytes/token generically -- no per-model hardcoding, no
-    guessing. Handles both GQA (num_key_value_heads present) and plain MHA
-    (falls back to num_attention_heads)."""
+    """Pull the REAL config.json for the base checkpoint and derive KV
+    bytes/token generically -- no per-model hardcoding, no guessing.
+
+    Handles both GQA (num_key_value_heads present) and plain MHA (falls
+    back to num_attention_heads), and both plain text-LM configs (fields
+    at the top level) and vision-language configs (the LM architecture
+    nested under "text_config", e.g. Idefics3/SmolVLM) -- the nested case
+    is what core/calibrate_mlx_vlm.py needs; this function is shared
+    rather than duplicated because the KV-bytes-per-token derivation
+    itself doesn't care whether a vision tower sits in front of the LM.
+
+    kv_dtype_bytes=2 (F16) is the default KV cache dtype for both
+    llama.cpp (core/calibrate.py) and MLX (core/calibrate_mlx.py /
+    calibrate_mlx_vlm.py) unless explicitly overridden, which none of the
+    measurement scripts in this repo do.
+    """
     url = f"https://huggingface.co/{base_config_repo}/raw/main/config.json"
     with urllib.request.urlopen(url, timeout=30) as resp:
         cfg = json.loads(resp.read())
 
-    hidden_size = cfg["hidden_size"]
-    num_layers = cfg["num_hidden_layers"]
-    num_attention_heads = cfg["num_attention_heads"]
-    num_kv_heads = cfg.get("num_key_value_heads", num_attention_heads)
-    head_dim = cfg.get("head_dim", hidden_size // num_attention_heads)
-    kv_dtype_bytes = 2  # llama.cpp default KV cache dtype (F16)
+    lm_cfg = cfg.get("text_config", cfg)  # vision-language configs nest the LM here
+
+    hidden_size = lm_cfg["hidden_size"]
+    num_layers = lm_cfg["num_hidden_layers"]
+    num_attention_heads = lm_cfg["num_attention_heads"]
+    num_kv_heads = lm_cfg.get("num_key_value_heads", num_attention_heads)
+    head_dim = lm_cfg.get("head_dim", hidden_size // num_attention_heads)
+    kv_dtype_bytes = 2  # F16, the default KV cache dtype on both backends here
 
     kv_bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * kv_dtype_bytes
 
     return {
         "source_config_url": url,
+        "nested_under_text_config": "text_config" in cfg,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "num_attention_heads": num_attention_heads,

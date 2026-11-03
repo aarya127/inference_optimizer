@@ -1,0 +1,56 @@
+{
+  "meta": {
+    "model_file": "SmolLM2-360M-Instruct-Q4_K_M.gguf",
+    "method": "B independent llama.cpp contexts (own weights copy, own KV cache each), B Python threads decoding concurrently with no server-side batching -- NOT llama.cpp's native multi-sequence batched llama_decode. Effective TBT/sequence = wall time for B threads x n_steps steps / n_steps."
+  },
+  "runs": [
+    {
+      "concurrency": 1,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 16.544996666908265,
+        "std": 20.791867030244372,
+        "trials_ms": [
+          53.73782363335292,
+          7.074422234296799,
+          7.153111100196838,
+          7.373123600085576,
+          7.386502766609192
+        ]
+      }
+    },
+    {
+      "concurrency": 2,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 13.739401946862538,
+        "std": 2.650348871150966,
+        "trials_ms": [
+          17.670918069283168,
+          11.769938900073369,
+          15.173008334636688,
+          11.355527766545613,
+          12.727616663773855
+        ]
+      }
+    },
+    {
+      "concurrency": 4,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 27.174163612922033,
+        "std": 4.660430666668426,
+        "trials_ms": [
+          35.20305833220482,
+          23.127390267451606,
+          26.069480566183724,
+          26.318016666173936,
+          25.152872232596078
+        ]
+      }
+    }
+  ]
+}

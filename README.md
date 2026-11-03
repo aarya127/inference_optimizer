@@ -71,6 +71,10 @@ baseline/
   measure_llamacpp.py              Second model+backend: Qwen2.5-0.5B/llama.cpp
   measure_quantization_tradeoff.py Real fp16/Q8_0/Q4_K_M measurement (size,
                                    speed, perplexity)
+  measure_llamacpp_concurrency.py  Real concurrent-decode measurement vs
+                                   ConcurrencyThroughputTechnique's MODELED
+                                   prediction (Tier 6) -- see
+                                   core/TIER6_REAL_CONCURRENCY_FINDINGS.md
 model_calibration/
   cost_model.py                    Measured fit + modeled extensions
   fit_llamacpp_prefill.py          Cost-model fit for the llama.cpp profile
@@ -88,9 +92,9 @@ core/
                                    real -> compare predicted vs measured
                                    (Tier 4) -- see core/TIER4_CLOSED_LOOP_FINDINGS.md
   optimize.py                     CLI: closed-loop recommend+execute+verify
-  calibrate.py, calibrate_mlx.py   Automated onboarding for llama.cpp and
-                                   MLX-LM models (Tier 5) -- see
-                                   core/TIER5_AUTO_ONBOARDING_FINDINGS.md
+  calibrate.py, calibrate_mlx.py,  Automated onboarding for llama.cpp,
+  calibrate_mlx_vlm.py             MLX-LM, and MLX-VLM models (Tier 5) --
+                                   see core/TIER5_AUTO_ONBOARDING_FINDINGS.md
 simulation/
   controller.py                    48-strategy adaptive controller
   resolution_scaler.py             Four real crop settings
@@ -232,11 +236,18 @@ scope/venv_phase0/bin/python integrated_service.py --api
   SmolVLM/MLX's margin is now honest enough to correctly report "no
   feasible token count" at 500ms instead of a lucky guess.
 - [core/TIER5_AUTO_ONBOARDING_FINDINGS.md](core/TIER5_AUTO_ONBOARDING_FINDINGS.md)
-  — a third model (SmolLM2-360M, llama.cpp) and a fourth (the same
-  Qwen2.5-0.5B already on llama.cpp, this time on MLX) onboarded end-to-end
-  by automated pipelines, zero hand-written per-model code. The same-model
+  — a third model (SmolLM2-360M, llama.cpp), a fourth (the same
+  Qwen2.5-0.5B already on llama.cpp, this time on MLX), and a fifth
+  (SmolVLM-256M, proving the vision side auto-calibrates too) onboarded
+  end-to-end with zero hand-written per-model code. The same-model
   cross-backend pair exposed two real bugs (margin basis, an unphysical
   negative decode slope) -- both now fixed, with before/after numbers kept
+- [core/TIER6_REAL_CONCURRENCY_FINDINGS.md](core/TIER6_REAL_CONCURRENCY_FINDINGS.md)
+  — the first real check of `ConcurrencyThroughputTechnique`'s MODELED
+  concurrency prediction against actual concurrent decode throughput;
+  found substantially too optimistic (real TBT degradation ~2.3x worse
+  than predicted at B=4) -- the technique is not silently recalibrated to
+  this one result, just honestly flagged as an optimistic lower bound
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the
