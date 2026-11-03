@@ -65,6 +65,61 @@ def test_qwen_profile_loads_from_real_fit():
     assert lo < hi
 
 
+def test_fit_decode_linear_clamps_negative_slope():
+    """core/calibrate.py's fit_decode_linear: a negative per-token decode
+    cost is not physically meaningful (more context can't make a token
+    cheaper). Reproduces the exact qwen25_05b_mlx_profile scenario that
+    surfaced this (5 narrow-range points giving a small negative slope,
+    which would predict negative latency by ctx~2048) -- the clamped fit
+    must not do that."""
+    from core.calibrate import fit_decode_linear
+
+    # Synthetic points with a slight (noise-driven) downward trend, same
+    # shape as the real qwen25_05b_mlx_profile decode sweep.
+    points = [
+        {"ctx_tokens": 32, "mean_ms": 10.5},
+        {"ctx_tokens": 64, "mean_ms": 10.3},
+        {"ctx_tokens": 128, "mean_ms": 10.1},
+        {"ctx_tokens": 256, "mean_ms": 9.9},
+        {"ctx_tokens": 384, "mean_ms": 9.7},
+    ]
+    fit = fit_decode_linear(points)
+    assert fit["clamped_negative_slope"] is True
+    assert fit["raw_fit_per_ctx_token_ms"] < 0  # the raw fit really was negative
+    assert fit["per_ctx_token_ms"] == 0.0  # but the usable fit is clamped
+    assert fit["overhead_ms"] > 0
+    # No context length should ever predict negative latency.
+    for ctx in (0, 384, 2048, 100_000):
+        assert fit["overhead_ms"] + fit["per_ctx_token_ms"] * ctx >= 0
+
+
+def test_fit_decode_linear_leaves_positive_slope_alone():
+    from core.calibrate import fit_decode_linear
+
+    points = [
+        {"ctx_tokens": 32, "mean_ms": 10.0},
+        {"ctx_tokens": 384, "mean_ms": 12.0},
+    ]
+    fit = fit_decode_linear(points)
+    assert fit["clamped_negative_slope"] is False
+    assert fit["per_ctx_token_ms"] == pytest.approx(fit["raw_fit_per_ctx_token_ms"])
+
+
+def test_fit_quadratic_with_loocv_reports_max_not_just_mean():
+    from core.calibrate import fit_quadratic_with_loocv
+
+    points = [
+        {"n_tokens": 100, "mean_ms": 350.0, "std_ms": 10.0},
+        {"n_tokens": 466, "mean_ms": 1100.0, "std_ms": 20.0},
+        {"n_tokens": 922, "mean_ms": 2300.0, "std_ms": 30.0},
+        {"n_tokens": 1560, "mean_ms": 4900.0, "std_ms": 40.0},
+    ]
+    fit = fit_quadratic_with_loocv(points)
+    assert "loocv_max_ape_pct" in fit
+    # The worst held-out point can only be >= the mean of all held-out errors.
+    assert fit["loocv_max_ape_pct"] >= fit["loocv_mape_pct"]
+
+
 def test_generic_calibration_loader_needs_no_per_model_code(tmp_path):
     """core/calibrate.py's whole point is that onboarding a new model needs
     no new loader function, unlike load_qwen_llamacpp_profile() /
@@ -81,7 +136,7 @@ def test_generic_calibration_loader_needs_no_per_model_code(tmp_path):
         "bandwidth_gbps": 100.0,
         "prefill": {
             "gamma": 1e-5, "beta": 0.5, "alpha": 10.0,
-            "domain_n": [32, 2048], "loocv_mape_pct": 7.5,
+            "domain_n": [32, 2048], "loocv_mape_pct": 7.5, "loocv_max_ape_pct": 22.3,
         },
         "decode": {"overhead_ms": 8.0, "per_ctx_token_ms": 0.002},
     }
@@ -93,6 +148,7 @@ def test_generic_calibration_loader_needs_no_per_model_code(tmp_path):
     assert profile.backend == "llama.cpp"
     assert profile.kv_bytes_per_token == 12345.0
     assert profile.prefill.loocv_mape_pct == 7.5
+    assert profile.prefill.loocv_max_ape_pct == 22.3
     assert profile.prefill.predict_ms(100) == pytest.approx(1e-5 * 100**2 + 0.5 * 100 + 10.0)
 
 
@@ -109,19 +165,64 @@ def test_prefill_budget_is_monotonic_in_sla():
         assert large.choice >= small.choice
 
 
-def test_prefill_budget_default_margin_is_profiles_own_loocv():
+def test_prefill_budget_default_margin_is_profiles_own_max_loocv():
     """Added after core/TIER4_CLOSED_LOOP_FINDINGS.md: a boundary-exact
     recommendation is fragile (Qwen missed a 500ms SLA by 2.8ms despite
     0.5% prediction error). Default margin should equal the profile's own
-    LOOCV MAPE, not a fabricated constant, and must produce <= the
-    zero-margin token count."""
+    max LOOCV AE (not the mean -- a mean-based margin was tried and found
+    to still miss the SLA reproducibly for qwen25_05b_mlx_profile), not a
+    fabricated constant, and must never recommend MORE tokens than the
+    zero-margin case (a margin can only make the budget tighter or, if the
+    margin consumes the whole budget, infeasible -- see the companion test
+    below for SmolVLM's 500ms case, where the honestly-sized margin now
+    correctly reports infeasibility instead of a number)."""
     profile = load_smolvlm_mlx_profile()
     tech = PrefillBudgetTechnique()
 
     no_margin = tech.recommend(profile, sla_ms=500.0, safety_margin_pct=0.0)
     default_margin = tech.recommend(profile, sla_ms=500.0)
-    assert f"{profile.prefill.loocv_mape_pct:.1f}% safety margin" in default_margin.rationale
-    assert default_margin.choice <= no_margin.choice
+    assert profile.prefill.loocv_max_ape_pct is not None
+    assert f"{profile.prefill.loocv_max_ape_pct:.1f}% safety margin" in default_margin.rationale
+    assert "max LOOCV AE" in default_margin.rationale
+    assert no_margin.choice is not None
+    # A margin can only shrink the recommendation -- possibly to "no
+    # feasible token count" (None), never to more tokens than no-margin.
+    if default_margin.choice is not None:
+        assert default_margin.choice <= no_margin.choice
+
+
+def test_prefill_budget_honest_margin_confirms_smolvlm_500ms_is_infeasible():
+    """With SmolVLM's honestly-sized margin (59.9% max LOOCV AE), the
+    effective budget (500*(1-0.599)=200.5ms) is below alpha (244.6ms,
+    SmolVLM's fixed prefill cost) -- the technique now correctly reports
+    no feasible token count, matching this project's own long-standing,
+    independently-established finding that the 500ms SLA is infeasible on
+    this hardware at every real crop setting (README.md). The earlier
+    mean-based margin (20.7%) was lenient enough to still recommend a
+    number (113 tokens) -- this is a case where the more conservative
+    margin produces the more correct answer, not just a more cautious one."""
+    profile = load_smolvlm_mlx_profile()
+    tech = PrefillBudgetTechnique()
+    rec = tech.recommend(profile, sla_ms=500.0)
+    assert rec.applicable
+    assert rec.choice is None
+    assert "no token count meets" in rec.rationale
+
+
+def test_prefill_budget_falls_back_to_mean_loocv_without_max():
+    """A profile calibrated before loocv_max_ape_pct existed (no per-point
+    LOOCV data retained) should fall back to the mean, not crash or
+    silently use 0."""
+    profile = load_smolvlm_mlx_profile()
+    # Simulate an older profile missing the max field.
+    import dataclasses
+    old_style = dataclasses.replace(profile, prefill=dataclasses.replace(
+        profile.prefill, loocv_max_ape_pct=None))
+
+    tech = PrefillBudgetTechnique()
+    rec = tech.recommend(old_style, sla_ms=500.0)
+    assert f"{old_style.prefill.loocv_mape_pct:.1f}% safety margin" in rec.rationale
+    assert "mean LOOCV MAPE" in rec.rationale
 
 
 def test_prefill_budget_rejects_invalid_margin():

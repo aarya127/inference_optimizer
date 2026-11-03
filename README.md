@@ -225,16 +225,18 @@ scope/venv_phase0/bin/python integrated_service.py --api
   — recommend, execute for real, compare predicted vs measured: Qwen/
   llama.cpp validated to 0.5%, but SmolVLM/MLX was off by 41-108% against a
   fresh real run despite R²=0.9996 in-sample -- a genuine, reproducible
-  finding, not smoothed over. A LOOCV-derived safety margin fixes Qwen's
-  boundary-fragility failure but, honestly, not SmolVLM's deeper one.
+  finding, not smoothed over. The safety margin now uses max (not mean)
+  LOOCV error after a mean-based version was caught missing its SLA
+  reproducibly; re-verified across all four profiles, every one that
+  returns a token budget now clears its SLA with real headroom, and
+  SmolVLM/MLX's margin is now honest enough to correctly report "no
+  feasible token count" at 500ms instead of a lucky guess.
 - [core/TIER5_AUTO_ONBOARDING_FINDINGS.md](core/TIER5_AUTO_ONBOARDING_FINDINGS.md)
   — a third model (SmolLM2-360M, llama.cpp) and a fourth (the same
   Qwen2.5-0.5B already on llama.cpp, this time on MLX) onboarded end-to-end
   by automated pipelines, zero hand-written per-model code. The same-model
-  cross-backend pair also exposed two real gaps: the safety margin still
-  missed its SLA reproducibly, and the MLX decode fit has an unphysical
-  negative slope from too few calibration points -- both documented, not
-  patched over
+  cross-backend pair exposed two real bugs (margin basis, an unphysical
+  negative decode slope) -- both now fixed, with before/after numbers kept
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

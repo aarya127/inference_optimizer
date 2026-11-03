@@ -100,16 +100,19 @@ Executors are standalone (not wrapped in `tests/test_core.py`), matching
 this repo's convention of keeping real, slow, model-loading measurements as
 runnable scripts rather than part of the fast pytest suite.
 
-`PrefillBudgetTechnique.recommend()` now defaults `safety_margin_pct` to
-the profile's own `loocv_mape_pct` rather than a fabricated constant —
-added after the Qwen finding above (a boundary-exact recommendation
-missing its SLA despite 0.5% prediction error). Re-running the closed loop
-with the margin: Qwen's recommendation moves off the boundary and its real
-run now comfortably clears the SLA. The margin does **not** fix SmolVLM's
-problem — its real-world error (41-108% depending on N) exceeds what a
-20.7%-derived margin can compensate for, and the SLA only passes in that
-case because the error happens to run in the conservative direction. Full
-detail in `TIER4_CLOSED_LOOP_FINDINGS.md`.
+`PrefillBudgetTechnique.recommend()` defaults `safety_margin_pct` to the
+profile's own **max LOOCV AE** (the worst single held-out point, not the
+mean) — added after the Qwen finding above (a boundary-exact
+recommendation missing its SLA despite 0.5% prediction error), and
+tightened further after a mean-based margin was tried and found
+insufficient (see TIER5 below). Re-verified across all four profiles: every
+one that returns a token budget now meets its SLA with real headroom, not
+a near-miss (e.g. Qwen/llama.cpp: 356.7ms measured vs a 500ms SLA, 31.7%
+margin). SmolVLM/MLX is the interesting case — its margin (59.9%) is now
+large enough that the technique correctly reports **no feasible token
+count** for a 500ms SLA, matching this project's own long-standing finding
+that the SLA is infeasible on this hardware. Full detail in
+`TIER4_CLOSED_LOOP_FINDINGS.md`.
 
 ## Tier 5: automated onboarding (no hand-written per-model code)
 
@@ -142,14 +145,15 @@ llama.cpp; identical `kv_bytes_per_token`, as expected for the same
 architecture). `MLXLMExecutor` is the generic text-only counterpart to the
 vision-specific `MLXExecutor`, resolving everything from `profile.model_id`.
 
-This also surfaced two things worth fixing before trusting this further:
-(1) the margin-adjusted recommendation for `qwen25_05b_mlx_profile` still
-missed its SLA on two separate real runs — a margin sized to *mean* LOOCV
-error gets breached about as often as real error exceeds that mean, by
-construction; (2) its decode fit has an unphysical negative slope from
-only 5 narrow-range calibration points, which neither calibration script
-currently guards against. Both are recorded in
-`TIER5_AUTO_ONBOARDING_FINDINGS.md` rather than quietly patched.
+This also surfaced two bugs, both now fixed rather than left as caveats:
+(1) the margin-adjusted recommendation for `qwen25_05b_mlx_profile` missed
+its SLA on two separate real runs — fixed by switching the default margin
+basis from mean to max LOOCV AE (see above); (2) its decode fit had an
+unphysical negative slope from only 5 narrow-range calibration points —
+`core/calibrate.py`'s `fit_decode_linear` now clamps a negative slope to 0
+(flat model) and keeps the raw, unclamped fit alongside it for
+transparency. Both fixes and their before/after numbers are recorded in
+`TIER5_AUTO_ONBOARDING_FINDINGS.md` and `TIER4_CLOSED_LOOP_FINDINGS.md`.
 
 ## What this is not (yet)
 
@@ -157,8 +161,8 @@ This is a proof of the abstraction on four profiles, four techniques, and
 three executors — not a general driver that loads arbitrary HuggingFace
 models on arbitrary backends, and not a production autotuner (still no
 automatic recalibration when a closed-loop check disagrees with the cost
-model, and the safety-margin heuristic is known to be too thin in at least
-one case above). Extending it further (a margin based on max rather than
-mean LOOCV error, a non-negativity guard on the decode fit, a real CUDA
-backend/profile, automatic margin tuning from closed-loop history) is
-future work; see the main README's roadmap.
+model — the margin is a static, LOOCV-derived buffer, not a response to
+live results). Extending it further (automatic margin tuning from
+closed-loop history, a real CUDA backend/profile, real batching/scheduling
+techniques measured against a real engine) is future work; see the main
+README's roadmap.

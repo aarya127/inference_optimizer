@@ -123,6 +123,49 @@ does not do this (yet); it's recorded here rather than silently patched
 in, since the obvious "just increase the default margin" fix would be
 tuned to these three examples, not derived from anything.
 
+## Resolution: margin now uses max LOOCV AE, not the mean
+
+`core/calibrate.py`'s `fit_quadratic_with_loocv` now also reports
+`loocv_max_ape_pct` (the worst single held-out point, not just the
+average), and `PrefillBudgetTechnique` prefers it over the mean for the
+default margin. Recomputed for every profile:
+
+| profile | mean LOOCV | max LOOCV AE |
+|---|---|---|
+| smolvlm_mlx | 20.7% | **59.9%** |
+| qwen_llamacpp | 5.7% | **31.7%** |
+| qwen25_05b_mlx_profile | 2.7% | **7.7%** |
+| smollm2_360m_llamacpp_profile | 2.7% | **10.4%** |
+
+Re-running the closed loop with the new margins, every profile that
+reports a token budget now meets its SLA with real headroom, not a
+near-miss:
+
+| profile | predicted | measured | margin held? |
+|---|---|---|---|
+| qwen_llamacpp | 341.8ms | 356.7ms | yes (143ms under SLA) |
+| qwen25_05b_mlx_profile | 461.4ms | 468.7ms, 472.8ms (2 runs) | yes |
+| smollm2_360m_llamacpp_profile | 447.5ms | 455.1ms | yes |
+
+**smolvlm_mlx is the interesting case**: with a 59.9% margin against a
+500ms SLA, the effective budget (200.5ms) is now below its fixed prefill
+cost (alpha=244.6ms), so `PrefillBudgetTechnique` reports **no feasible
+token count** rather than a number. This is not a bug — it is the honestly
+correct answer, and it now matches this project's own long-standing,
+independently-established finding (README.md: "The 500 ms TTFT SLA is
+infeasible at every real crop setting on this hardware"). The earlier
+mean-based margin (20.7%) was lenient enough to still produce a number
+(113 tokens) that happened to pass in testing by luck of error direction
+— the more conservative margin doesn't just reduce risk here, it produces
+the *correct* answer instead of a lucky one.
+
+This is not declared "solved" — max-of-a-small-sample is still a
+resampling estimate, not a guarantee, and a profile with few calibration
+points (or one as fundamentally unreliable as SmolVLM across sessions, see
+above) can still have real error exceeding even its max LOOCV AE on some
+future run. It is a meaningfully better basis than the mean, confirmed by
+every closed-loop run above, not merely argued for.
+
 ## Practical implication for the "universal tool" vision
 
 A recommendation engine that only trusts its own calibration (LOOCV) can

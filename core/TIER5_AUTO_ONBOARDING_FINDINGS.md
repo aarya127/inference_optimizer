@@ -110,6 +110,28 @@ against this (unlike `model_calibration/calibrate_cost_model.py`'s
 existing alpha-clamping for the prefill fit) — a real gap to fix before
 trusting any profile's decode numbers past its narrow calibrated range.
 
+## Both findings above are now fixed
+
+See `TIER4_CLOSED_LOOP_FINDINGS.md`'s "Resolution" section for full
+before/after numbers. Summary:
+
+- **Margin basis**: `core/calibrate.py`'s `fit_quadratic_with_loocv` now
+  also reports `loocv_max_ape_pct` (worst single held-out point), and
+  `PrefillBudgetTechnique` defaults to it instead of the mean. Recomputed
+  for this profile (a fresh calibration run, so the exact numbers differ
+  slightly from the ones above by natural run-to-run variance): mean LOOCV
+  2.68%, max LOOCV AE **7.74%**. Re-running the closed loop with the new
+  margin: predicted 461.4ms, measured 468.7ms and 472.8ms across two runs
+  — comfortably under the 500ms SLA both times, not a near-miss.
+- **Decode fit**: `fit_decode_linear` now clamps a negative slope to 0 (a
+  flat model) and retains the raw, unclamped fit in the output for
+  transparency (`raw_fit_per_ctx_token_ms`, `clamped_negative_slope`). The
+  fresh calibration run above happened to produce a (tiny) positive slope
+  naturally, so the clamp didn't fire this time — it remains in place as a
+  guard for whenever a future run reproduces the negative-slope artifact,
+  verified directly against a reproduction of the original scenario in
+  `tests/test_core.py::test_fit_decode_linear_clamps_negative_slope`.
+
 ## What this still doesn't do
 
 - Only handles llama.cpp-backed models. An equivalent generic pipeline for

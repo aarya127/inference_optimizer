@@ -10,20 +10,27 @@ Qwen2.5/llama.cpp in core/demo.py.
 Safety margin (added after core/TIER4_CLOSED_LOOP_FINDINGS.md): a
 recommendation that targets the SLA exactly is fragile. Qwen/llama.cpp's
 closed-loop test predicted 500.1ms against a 500ms SLA (0.5% error, well
-within its 5.7% LOOCV) and still measured 502.8ms on a fresh real run --
-missing the SLA despite an excellent cost model, purely because the
-recommendation left zero headroom. Rather than inventing a new margin
-constant, `recommend()` defaults `safety_margin_pct` to the profile's own
-`loocv_mape_pct` -- the honest, already-measured estimate of how far off
-this profile's predictions tend to run. This helps exactly the failure
-mode it targets (boundary fragility on an otherwise-accurate model, as
-seen for Qwen) -- it does NOT fix a profile whose real-world error exceeds
-its own LOOCV, which is exactly SmolVLM/MLX's problem
-(TIER4_CLOSED_LOOP_FINDINGS.md: 41-72% real error vs a 20.7% LOOCV
-estimate). A margin derived from a benchmark that itself underestimates
-the model's real unreliability cannot compensate for that; it is applied
-here anyway, honestly, and still shown coming up short for SmolVLM in
-TIER4_CLOSED_LOOP_FINDINGS.md's follow-up.
+within its 5.7% mean LOOCV) and still measured 502.8ms on a fresh real
+run -- missing the SLA despite an excellent cost model, purely because the
+recommendation left zero headroom.
+
+`recommend()` defaults `safety_margin_pct` to the profile's own
+`loocv_max_ape_pct` (the worst single held-out point from leave-one-out
+cross-validation) -- not the mean. The mean was tried first and found
+insufficient: a margin sized to it gets breached about as often as real
+error exceeds that mean, BY CONSTRUCTION, and this was confirmed directly
+-- qwen25_05b_mlx_profile's mean-based margin (2.0%, from its 2.05% mean
+LOOCV) missed its SLA on two separate real runs with 2.4-2.6% real error
+(TIER4_CLOSED_LOOP_FINDINGS.md's second follow-up). The max is itself
+still just a resampling estimate from a handful of calibration points, not
+a hard worst case -- it helped close that specific gap (Qwen/llama.cpp's
+max LOOCV AE is 31.7%, vs a 5.7% mean) and brought SmolVLM/MLX's margin
+far closer to its real 41-108% closed-loop error (max LOOCV AE 59.9%, vs a
+20.7% mean) -- but it is still not a guarantee, particularly for SmolVLM,
+whose real-world unreliability has repeatedly exceeded even generous
+historical estimates. Falls back to `loocv_mape_pct` (mean) only for
+profiles calibrated before per-point LOOCV data was retained, and to 0.0
+when neither exists.
 """
 
 from __future__ import annotations
@@ -40,6 +47,13 @@ class PrefillBudgetTechnique(Technique):
     def applies_to(self, profile: ModelHardwareProfile) -> bool:
         return profile.prefill is not None
 
+    def _default_margin(self, profile: ModelHardwareProfile) -> tuple[float, str]:
+        if profile.prefill.loocv_max_ape_pct is not None:
+            return profile.prefill.loocv_max_ape_pct, "profile max LOOCV AE"
+        if profile.prefill.loocv_mape_pct is not None:
+            return profile.prefill.loocv_mape_pct, "profile mean LOOCV MAPE (max LOOCV AE not available)"
+        return 0.0, "no LOOCV data available"
+
     def recommend(
         self,
         profile: ModelHardwareProfile,
@@ -50,11 +64,9 @@ class PrefillBudgetTechnique(Technique):
             return Recommendation(False, None, None,
                                    "profile has no calibrated prefill cost model")
 
+        margin_source = "caller-specified"
         if safety_margin_pct is None:
-            # Default to this profile's own honest LOOCV MAPE, when known,
-            # rather than a fabricated constant. 0.0 (no margin) only when
-            # the profile has no LOOCV estimate at all.
-            safety_margin_pct = profile.prefill.loocv_mape_pct or 0.0
+            safety_margin_pct, margin_source = self._default_margin(profile)
 
         if not (0.0 <= safety_margin_pct < 100.0):
             return Recommendation(True, None, None,
@@ -64,8 +76,7 @@ class PrefillBudgetTechnique(Technique):
 
         n = profile.prefill.max_tokens_for_budget(effective_budget_ms)
         margin_note = (
-            f"{safety_margin_pct:.1f}% safety margin applied "
-            f"({'profile LOOCV MAPE' if safety_margin_pct == (profile.prefill.loocv_mape_pct or 0.0) else 'caller-specified'}) "
+            f"{safety_margin_pct:.1f}% safety margin applied ({margin_source}) "
             f"-> effective budget {effective_budget_ms:.1f}ms"
         )
         if n is None:

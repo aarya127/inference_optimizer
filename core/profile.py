@@ -39,6 +39,11 @@ class PrefillCostModel:
     domain_n: Tuple[float, float]
     loocv_mape_pct: Optional[float]
     source: str
+    # Worst single held-out LOOCV point, not the average -- see
+    # core/TIER4_CLOSED_LOOP_FINDINGS.md. None for profiles calibrated
+    # before this field existed (no per-point LOOCV data was retained);
+    # PrefillBudgetTechnique falls back to loocv_mape_pct in that case.
+    loocv_max_ape_pct: Optional[float] = None
 
     def predict_ms(self, n_tokens: float) -> float:
         return self.gamma * n_tokens ** 2 + self.beta * n_tokens + self.alpha
@@ -114,6 +119,15 @@ def load_smolvlm_mlx_profile() -> ModelHardwareProfile:
         prefill=PrefillCostModel(
             gamma=C.PREFILL_GAMMA, beta=C.PREFILL_BETA, alpha=C.PREFILL_ALPHA,
             domain_n=C.PREFILL_DOMAIN, loocv_mape_pct=20.7,
+            # Worst single held-out point of the 4-point LOOCV (held-out
+            # N=100 -> 59.9% APE), computed one-off from
+            # baseline/results_v2.json with the same leave-one-out method
+            # as core/calibrate.py's fit_quadratic_with_loocv (not stored
+            # in a JSON for this hand-built profile, unlike auto-calibrated
+            # ones). Notably much closer to the 41-108% real closed-loop
+            # error this profile actually showed than the 20.7% mean was --
+            # see core/TIER4_CLOSED_LOOP_FINDINGS.md.
+            loocv_max_ape_pct=59.9,
             source="baseline/results_v2.json (4 points)",
         ),
         decode=DecodeCostModel(
@@ -187,6 +201,7 @@ def load_qwen_llamacpp_profile() -> ModelHardwareProfile:
             gamma=fit["gamma"], beta=fit["beta"], alpha=fit["alpha"],
             domain_n=tuple(fit["domain_n"]),
             loocv_mape_pct=fit["loocv_mape_pct"],
+            loocv_max_ape_pct=fit.get("loocv_max_ape_pct"),
             source="baseline/results_llamacpp.json (10 points)",
         ),
         decode=DecodeCostModel(
@@ -218,6 +233,7 @@ def load_profile_from_calibration_json(path) -> ModelHardwareProfile:
         prefill=PrefillCostModel(
             gamma=p["gamma"], beta=p["beta"], alpha=p["alpha"],
             domain_n=tuple(p["domain_n"]), loocv_mape_pct=p["loocv_mape_pct"],
+            loocv_max_ape_pct=p.get("loocv_max_ape_pct"),
             source=str(path),
         ),
         decode=DecodeCostModel(

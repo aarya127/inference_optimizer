@@ -43,6 +43,11 @@ def main():
         pred_i = float(np.polyval(c_i, n_arr[i]))
         loocv_apes.append(abs(pred_i - t_arr[i]) / t_arr[i] * 100)
     loocv_mape = float(np.mean(loocv_apes))
+    # Worst single held-out point, not just the average -- see
+    # core/TIER4_CLOSED_LOOP_FINDINGS.md: a safety margin sized to the mean
+    # LOOCV error gets breached about as often as real error exceeds that
+    # mean, by construction. core/techniques/prefill_budget.py prefers this.
+    loocv_max_ape = float(np.max(loocv_apes))
 
     print(f"llama.cpp / Qwen2.5-0.5B-Instruct-Q4_K_M, Metal GPU offload")
     print(f"N points: {len(points)}  (domain N in [{n_arr.min():.0f}, {n_arr.max():.0f}])")
@@ -56,6 +61,7 @@ def main():
     print(f"  R^2 (in-sample)  = {r2:.4f}")
     print(f"  MAPE (in-sample) = {insample_mape:.2f}%")
     print(f"  MAPE (LOOCV)     = {loocv_mape:.2f}%")
+    print(f"  Max AE (LOOCV)   = {loocv_max_ape:.2f}%")
     print(f"\nCompare against MLX/SmolVLM 4-point fit: R^2=0.9996 in-sample, "
           f"LOOCV=20.7% (see amio_constants.py / README.md).")
 
@@ -71,6 +77,7 @@ def main():
     out = {
         "gamma": gamma, "beta": beta, "alpha": alpha, "r2": r2,
         "insample_mape_pct": insample_mape, "loocv_mape_pct": loocv_mape,
+        "loocv_max_ape_pct": loocv_max_ape,
         "n_points": len(points),
         "domain_n": [float(n_arr.min()), float(n_arr.max())],
         "decode_tbt_overhead_ms": float(tbt_coeffs[1]),

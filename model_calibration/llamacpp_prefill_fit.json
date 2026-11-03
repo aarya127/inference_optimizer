@@ -5,6 +5,7 @@
   "r2": 0.9995747940679379,
   "insample_mape_pct": 2.304841769637875,
   "loocv_mape_pct": 5.718981070726592,
+  "loocv_max_ape_pct": 31.68285790262698,
   "n_points": 10,
   "domain_n": [
     32.0,
