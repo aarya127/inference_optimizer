@@ -12,6 +12,7 @@ Run with: pytest tests/test_core.py -v
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -21,7 +22,11 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.profile import load_smolvlm_mlx_profile, load_qwen_llamacpp_profile
+from core.profile import (
+    load_smolvlm_mlx_profile,
+    load_qwen_llamacpp_profile,
+    load_profile_from_calibration_json,
+)
 from core.techniques.concurrency_throughput import ConcurrencyThroughputTechnique
 from core.techniques.kv_cache_budget import KVCacheBudgetTechnique
 from core.techniques.prefill_budget import PrefillBudgetTechnique
@@ -58,6 +63,37 @@ def test_qwen_profile_loads_from_real_fit():
     assert profile.supports_vision is False
     lo, hi = profile.prefill.domain_n
     assert lo < hi
+
+
+def test_generic_calibration_loader_needs_no_per_model_code(tmp_path):
+    """core/calibrate.py's whole point is that onboarding a new model needs
+    no new loader function, unlike load_qwen_llamacpp_profile() /
+    load_smolvlm_mlx_profile() which have that model's constants inlined.
+    This exercises the loader against a synthetic but schema-correct
+    calibration JSON -- no network or real model load required, so it stays
+    in the fast suite."""
+    calib = {
+        "model_id": "fake/TestModel-360M",
+        "backend": "llama.cpp",
+        "hardware": "Apple M3 base (10-core GPU, 8GB unified, 100GB/s), Metal offload",
+        "supports_vision": False,
+        "kv_bytes_per_token": 12345.0,
+        "bandwidth_gbps": 100.0,
+        "prefill": {
+            "gamma": 1e-5, "beta": 0.5, "alpha": 10.0,
+            "domain_n": [32, 2048], "loocv_mape_pct": 7.5,
+        },
+        "decode": {"overhead_ms": 8.0, "per_ctx_token_ms": 0.002},
+    }
+    path = tmp_path / "fake_llamacpp_profile.json"
+    path.write_text(json.dumps(calib))
+
+    profile = load_profile_from_calibration_json(path)
+    assert profile.model_id == "fake/TestModel-360M"
+    assert profile.backend == "llama.cpp"
+    assert profile.kv_bytes_per_token == 12345.0
+    assert profile.prefill.loocv_mape_pct == 7.5
+    assert profile.prefill.predict_ms(100) == pytest.approx(1e-5 * 100**2 + 0.5 * 100 + 10.0)
 
 
 def test_prefill_budget_is_monotonic_in_sla():

@@ -23,7 +23,6 @@ from PIL import Image
 from core.executor import Executor, ExecutionResult
 from core.profile import ModelHardwareProfile
 
-MODEL_ID = "mlx-community/SmolVLM-Instruct-4bit"
 _FILLER = ("Please look closely at the background, the foreground, the "
            "colors, and the overall composition before answering. ")
 
@@ -37,16 +36,21 @@ class MLXExecutor(Executor):
         self._model = None
         self._processor = None
         self._image = None
+        self._loaded_model_id = None
 
     def supports(self, profile: ModelHardwareProfile) -> bool:
-        return profile.backend == "mlx"
+        # Restricted to vision profiles: this executor's real call goes
+        # through mlx_vlm's image + get_input_embeddings path. A plain
+        # text MLX-LM profile is handled by MLXLMExecutor instead.
+        return profile.backend == "mlx" and profile.supports_vision
 
-    def _ensure_loaded(self):
-        if self._model is not None:
+    def _ensure_loaded(self, model_id: str):
+        if self._model is not None and self._loaded_model_id == model_id:
             return
         from mlx_vlm import load
 
-        self._model, self._processor = load(MODEL_ID)
+        self._model, self._processor = load(model_id)
+        self._loaded_model_id = model_id
 
         rng = np.random.default_rng(42)
         base = rng.random((1024, 1024, 3)) * 0.5
@@ -93,7 +97,7 @@ class MLXExecutor(Executor):
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
-        self._ensure_loaded()
+        self._ensure_loaded(profile.model_id)
         arrays, actual_n = self._build_inputs(n_tokens)
 
         def _one_prefill():

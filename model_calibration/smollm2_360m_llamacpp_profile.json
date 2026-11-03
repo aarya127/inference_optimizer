@@ -1,0 +1,90 @@
+{
+  "model_id": "HuggingFaceTB/SmolLM2-360M-Instruct",
+  "backend": "llama.cpp",
+  "hardware": "Apple M3 base (10-core GPU, 8GB unified, 100GB/s), Metal offload",
+  "gguf_repo": "bartowski/SmolLM2-360M-Instruct-GGUF",
+  "gguf_filename": "SmolLM2-360M-Instruct-Q4_K_M.gguf",
+  "supports_vision": false,
+  "architecture": {
+    "source_config_url": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/raw/main/config.json",
+    "hidden_size": 960,
+    "num_layers": 32,
+    "num_attention_heads": 15,
+    "num_kv_heads": 5,
+    "head_dim": 64,
+    "kv_dtype_bytes": 2,
+    "kv_bytes_per_token": 40960,
+    "uses_gqa": true
+  },
+  "kv_bytes_per_token": 40960,
+  "bandwidth_gbps": 100.0,
+  "prefill": {
+    "gamma": 5.717109318302128e-05,
+    "beta": 0.36067475310866187,
+    "alpha": 4.8957928189556315,
+    "r2": 0.9999459118680154,
+    "insample_mape_pct": 1.6113990180676088,
+    "loocv_mape_pct": 2.7593467289549922,
+    "domain_n": [
+      32.0,
+      2048.0
+    ],
+    "n_points": 10,
+    "points": [
+      {
+        "n_tokens": 32,
+        "mean_ms": 17.043510496616364,
+        "std_ms": 0.4005057508248719
+      },
+      {
+        "n_tokens": 64,
+        "mean_ms": 27.946552127599716,
+        "std_ms": 0.8486335861411152
+      },
+      {
+        "n_tokens": 128,
+        "mean_ms": 50.51573448628187,
+        "std_ms": 0.9007141025265069
+      },
+      {
+        "n_tokens": 256,
+        "mean_ms": 95.26450000703335,
+        "std_ms": 0.8888459025033498
+      },
+      {
+        "n_tokens": 384,
+        "mean_ms": 154.69630213826895,
+        "std_ms": 0.6384321661942696
+      },
+      {
+        "n_tokens": 512,
+        "mean_ms": 204.40739074349403,
+        "std_ms": 1.0445795043021349
+      },
+      {
+        "n_tokens": 768,
+        "mean_ms": 313.5658333674073,
+        "std_ms": 1.2810935881948726
+      },
+      {
+        "n_tokens": 1024,
+        "mean_ms": 435.0754998847842,
+        "std_ms": 1.6197475681588964
+      },
+      {
+        "n_tokens": 1536,
+        "mean_ms": 694.7327030226588,
+        "std_ms": 3.540758812907976
+      },
+      {
+        "n_tokens": 2048,
+        "mean_ms": 982.4329842478037,
+        "std_ms": 3.542175241598746
+      }
+    ]
+  },
+  "decode": {
+    "overhead_ms": 8.13147454067187,
+    "per_ctx_token_ms": 0.012746415670615246
+  }
+}

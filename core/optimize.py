@@ -18,11 +18,12 @@ import argparse
 
 from core.executors.llamacpp_executor import LlamaCppExecutor
 from core.executors.mlx_executor import MLXExecutor
+from core.executors.mlx_lm_executor import MLXLMExecutor
 from core.profile import load_all_profiles
 from core.techniques.prefill_budget import PrefillBudgetTechnique
 from core.techniques.quantization_level import QuantizationLevelTechnique
 
-EXECUTORS = [LlamaCppExecutor(), MLXExecutor()]
+EXECUTORS = [LlamaCppExecutor(), MLXExecutor(), MLXLMExecutor()]
 
 
 def optimize_and_verify(profile_name: str, profile, sla_ms: float,
@@ -68,8 +69,10 @@ def optimize_and_verify(profile_name: str, profile, sla_ms: float,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", choices=["smolvlm_mlx", "qwen_llamacpp", "all"],
-                     default="all")
+    ap.add_argument("--profile", default="all",
+                     help="profile name from core.profile.load_all_profiles(), "
+                          "or 'all' (includes any auto-calibrated profiles "
+                          "found in model_calibration/*_llamacpp_profile.json)")
     ap.add_argument("--sla-ms", type=float, default=500.0)
     ap.add_argument("--max-file-size-mb", type=float, default=700.0)
     args = ap.parse_args()

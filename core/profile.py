@@ -74,6 +74,7 @@ class QuantLevelStats:
     prefill_ms_at_reference_n: float
     reference_n: int
     decode_tbt_ms: float
+    gguf_filename: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,11 @@ class ModelHardwareProfile:
     # derived from the checkpoint's real config.json -- never fabricated.
     kv_bytes_per_token: Optional[float] = None
     bandwidth_gbps: Optional[float] = None
+    # The GGUF/weights filename an Executor should load by default (single-
+    # quant-level profiles, e.g. auto-calibrated ones). Profiles with
+    # multiple measured quant levels instead resolve a filename per level
+    # via quant_levels[level].gguf_filename.
+    gguf_filename: Optional[str] = None
 
 
 def load_smolvlm_mlx_profile() -> ModelHardwareProfile:
@@ -138,6 +144,16 @@ QWEN25_05B_KV_BYTES_PER_TOKEN = (
     * QWEN25_05B_HEAD_DIM * QWEN25_05B_KV_DTYPE_BYTES
 )  # = 12,288 B/token -- 16x smaller than SmolVLM's 196,608 (smaller model + GQA)
 
+# GGUF filenames per quant level, as downloaded in baseline/TIER2_LLAMACPP_FINDINGS.md.
+# Single source of truth: core/executors/llamacpp_executor.py resolves a
+# profile's files through quant_levels[level].gguf_filename / gguf_filename,
+# not a module-local constant, so this is the only place these are listed.
+QWEN25_05B_QUANT_FILENAMES = {
+    "fp16": "qwen2.5-0.5b-instruct-fp16.gguf",
+    "q8_0": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "q4_k_m": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+}
+
 
 def load_qwen_llamacpp_profile() -> ModelHardwareProfile:
     """Qwen2.5-0.5B-Instruct / llama.cpp (Metal) / Apple M3 -- from
@@ -158,6 +174,7 @@ def load_qwen_llamacpp_profile() -> ModelHardwareProfile:
                 prefill_ms_at_reference_n=e["prefill_by_n_tokens"][str(reference_n)]["mean_ms"],
                 reference_n=reference_n,
                 decode_tbt_ms=e["decode_tbt"]["mean_ms"],
+                gguf_filename=QWEN25_05B_QUANT_FILENAMES.get(name),
             )
             for name, e in quant_data["levels"].items()
         }
@@ -181,6 +198,37 @@ def load_qwen_llamacpp_profile() -> ModelHardwareProfile:
         supports_vision=False,
         kv_bytes_per_token=QWEN25_05B_KV_BYTES_PER_TOKEN,
         bandwidth_gbps=100.0,  # same M3 unified-memory bandwidth as the MLX profile
+        gguf_filename=QWEN25_05B_QUANT_FILENAMES["q4_k_m"],  # default when no quant_level given
+    )
+
+
+def load_profile_from_calibration_json(path) -> ModelHardwareProfile:
+    """Generic loader for the self-describing JSON schema core/calibrate.py
+    emits -- no per-model code required. This is the automated counterpart
+    to load_qwen_llamacpp_profile()/load_smolvlm_mlx_profile(), which are
+    hand-built from this project's own measurement history; this is the
+    path for any NEW model calibrated with core/calibrate.py."""
+    data = json.loads(Path(path).read_text())
+    p = data["prefill"]
+    d = data["decode"]
+    return ModelHardwareProfile(
+        model_id=data["model_id"],
+        backend=data["backend"],
+        hardware=data["hardware"],
+        prefill=PrefillCostModel(
+            gamma=p["gamma"], beta=p["beta"], alpha=p["alpha"],
+            domain_n=tuple(p["domain_n"]), loocv_mape_pct=p["loocv_mape_pct"],
+            source=str(path),
+        ),
+        decode=DecodeCostModel(
+            overhead_ms=d["overhead_ms"], per_ctx_token_ms=d["per_ctx_token_ms"],
+            source=str(path),
+        ),
+        quant_levels=None,
+        supports_vision=data.get("supports_vision", False),
+        kv_bytes_per_token=data.get("kv_bytes_per_token"),
+        bandwidth_gbps=data.get("bandwidth_gbps"),
+        gguf_filename=data.get("gguf_filename"),
     )
 
 
@@ -190,4 +238,17 @@ def load_all_profiles() -> Dict[str, ModelHardwareProfile]:
         profiles["qwen_llamacpp"] = load_qwen_llamacpp_profile()
     except FileNotFoundError:
         pass
+
+    # Any auto-calibrated profiles produced by core/calibrate.py or
+    # core/calibrate_mlx.py -- both emit the same self-describing schema,
+    # distinguished only by filename suffix convention.
+    calib_dir = ROOT / "model_calibration"
+    if calib_dir.exists():
+        patterns = ("*_llamacpp_profile.json", "*_mlx_profile.json")
+        calib_files = sorted({f for p in patterns for f in calib_dir.glob(p)})
+        for f in calib_files:
+            try:
+                profiles[f.stem] = load_profile_from_calibration_json(f)
+            except Exception as e:
+                print(f"warning: failed to load {f}: {e}")
     return profiles

@@ -88,6 +88,9 @@ core/
                                    real -> compare predicted vs measured
                                    (Tier 4) -- see core/TIER4_CLOSED_LOOP_FINDINGS.md
   optimize.py                     CLI: closed-loop recommend+execute+verify
+  calibrate.py, calibrate_mlx.py   Automated onboarding for llama.cpp and
+                                   MLX-LM models (Tier 5) -- see
+                                   core/TIER5_AUTO_ONBOARDING_FINDINGS.md
 simulation/
   controller.py                    48-strategy adaptive controller
   resolution_scaler.py             Four real crop settings
@@ -220,9 +223,18 @@ scope/venv_phase0/bin/python integrated_service.py --api
   with genuinely different applicability and recommendations per profile
 - [core/TIER4_CLOSED_LOOP_FINDINGS.md](core/TIER4_CLOSED_LOOP_FINDINGS.md)
   — recommend, execute for real, compare predicted vs measured: Qwen/
-  llama.cpp validated to 0.5%, but SmolVLM/MLX was off by 41-72% against a
+  llama.cpp validated to 0.5%, but SmolVLM/MLX was off by 41-108% against a
   fresh real run despite R²=0.9996 in-sample -- a genuine, reproducible
-  finding, not smoothed over
+  finding, not smoothed over. A LOOCV-derived safety margin fixes Qwen's
+  boundary-fragility failure but, honestly, not SmolVLM's deeper one.
+- [core/TIER5_AUTO_ONBOARDING_FINDINGS.md](core/TIER5_AUTO_ONBOARDING_FINDINGS.md)
+  — a third model (SmolLM2-360M, llama.cpp) and a fourth (the same
+  Qwen2.5-0.5B already on llama.cpp, this time on MLX) onboarded end-to-end
+  by automated pipelines, zero hand-written per-model code. The same-model
+  cross-backend pair also exposed two real gaps: the safety margin still
+  missed its SLA reproducibly, and the MLX decode fit has an unphysical
+  negative slope from too few calibration points -- both documented, not
+  patched over
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

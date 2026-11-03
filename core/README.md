@@ -23,6 +23,17 @@ invented number:
   from `model_calibration/llamacpp_prefill_fit.json` (10 points, LOOCV
   5.7%) and `baseline/results_quantization_tradeoff.json` (real fp16 /
   Q8_0 / Q4_K_M measurements — see `baseline/TIER2_LLAMACPP_FINDINGS.md`).
+- `smollm2_360m_llamacpp_profile` — SmolLM2-360M-Instruct / llama.cpp
+  (Metal) / Apple M3, auto-calibrated end-to-end by `core/calibrate.py`
+  (10 points, LOOCV 2.76%) — see `TIER5_AUTO_ONBOARDING_FINDINGS.md`. No
+  model-specific loader function exists for this one;
+  `load_profile_from_calibration_json` is generic.
+- `qwen25_05b_mlx_profile` — the *same* Qwen2.5-0.5B-Instruct model as
+  `qwen_llamacpp`, this time on MLX, auto-calibrated by
+  `core/calibrate_mlx.py` (LOOCV 2.05% — tighter than the llama.cpp
+  version of the same model). A genuine same-model, cross-backend
+  comparison; `kv_bytes_per_token` comes out identical (12,288) on both
+  backends, as it should for the same real architecture.
 
 A `Technique` declares `applies_to(profile)` and `recommend(profile, ...)`.
 Two are implemented, chosen specifically because they demonstrate
@@ -89,13 +100,65 @@ Executors are standalone (not wrapped in `tests/test_core.py`), matching
 this repo's convention of keeping real, slow, model-loading measurements as
 runnable scripts rather than part of the fast pytest suite.
 
+`PrefillBudgetTechnique.recommend()` now defaults `safety_margin_pct` to
+the profile's own `loocv_mape_pct` rather than a fabricated constant —
+added after the Qwen finding above (a boundary-exact recommendation
+missing its SLA despite 0.5% prediction error). Re-running the closed loop
+with the margin: Qwen's recommendation moves off the boundary and its real
+run now comfortably clears the SLA. The margin does **not** fix SmolVLM's
+problem — its real-world error (41-108% depending on N) exceeds what a
+20.7%-derived margin can compensate for, and the SLA only passes in that
+case because the error happens to run in the conservative direction. Full
+detail in `TIER4_CLOSED_LOOP_FINDINGS.md`.
+
+## Tier 5: automated onboarding (no hand-written per-model code)
+
+`core/calibrate.py` generalizes the measurement methodology behind
+`qwen_llamacpp` into a reusable pipeline for any llama.cpp/GGUF model:
+download, real prefill/decode calibration, weighted quadratic fit with
+honest LOOCV, and real `kv_bytes_per_token` pulled from the checkpoint's
+own `config.json` — emitted as one self-describing JSON.
+`load_profile_from_calibration_json` turns that into a working profile
+with no new code. Proven by onboarding a third model, SmolLM2-360M-Instruct,
+end-to-end (LOOCV 2.76% — the best of the three profiles). The
+`LlamaCppExecutor` was refactored alongside this so it resolves which GGUF
+file to load from the profile itself (`resolve_gguf_filename`), not a
+hardcoded per-model dict — necessary for it to work against a profile it
+has never seen before. See `TIER5_AUTO_ONBOARDING_FINDINGS.md`.
+
+```bash
+scope/venv_phase0/bin/python -m core.calibrate \
+  --model-id <hf-model-id> --gguf-repo <repo> --gguf-filename <file> \
+  --base-config-repo <hf-model-id> --out model_calibration/<name>_llamacpp_profile.json
+scope/venv_phase0/bin/python -m core.optimize --profile <name>_llamacpp_profile --sla-ms 500
+```
+
+`core/calibrate_mlx.py` extends the same automated approach to MLX-LM text
+models, reusing `core/calibrate.py`'s fit/architecture functions unchanged
+(they were already backend-agnostic). Proven by calibrating the *same*
+Qwen2.5-0.5B-Instruct model already profiled on llama.cpp — a genuine
+same-model, cross-backend comparison (LOOCV 2.05% on MLX vs 5.72% on
+llama.cpp; identical `kv_bytes_per_token`, as expected for the same
+architecture). `MLXLMExecutor` is the generic text-only counterpart to the
+vision-specific `MLXExecutor`, resolving everything from `profile.model_id`.
+
+This also surfaced two things worth fixing before trusting this further:
+(1) the margin-adjusted recommendation for `qwen25_05b_mlx_profile` still
+missed its SLA on two separate real runs — a margin sized to *mean* LOOCV
+error gets breached about as often as real error exceeds that mean, by
+construction; (2) its decode fit has an unphysical negative slope from
+only 5 narrow-range calibration points, which neither calibration script
+currently guards against. Both are recorded in
+`TIER5_AUTO_ONBOARDING_FINDINGS.md` rather than quietly patched.
+
 ## What this is not (yet)
 
-This is a proof of the abstraction on two profiles, four techniques, and
-two executors — not a general driver that loads arbitrary HuggingFace/GGUF
-models and auto-calibrates them, and not a production autotuner (no safety
-margins, no automatic recalibration when a closed-loop check disagrees
-with the cost model). Extending it further (more techniques, an
-auto-calibration pipeline instead of hand-run scripts, more profiles, a
-safety-margin-aware PrefillBudgetTechnique) is future work; see the main
-README's roadmap.
+This is a proof of the abstraction on four profiles, four techniques, and
+three executors — not a general driver that loads arbitrary HuggingFace
+models on arbitrary backends, and not a production autotuner (still no
+automatic recalibration when a closed-loop check disagrees with the cost
+model, and the safety-margin heuristic is known to be too thin in at least
+one case above). Extending it further (a margin based on max rather than
+mean LOOCV error, a non-negativity guard on the decode fit, a real CUDA
+backend/profile, automatic margin tuning from closed-loop history) is
+future work; see the main README's roadmap.

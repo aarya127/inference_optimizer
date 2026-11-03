@@ -101,6 +101,28 @@ itself being reliable (SmolVLM) — no downstream technique can safety-margin
 its way out of a cost model whose real generalization error exceeds what
 its own validation metric reported.
 
+## Second follow-up: even a well-calibrated profile can still miss, by a hair
+
+`qwen25_05b_mlx_profile` (core/TIER5_AUTO_ONBOARDING_FINDINGS.md) has an
+excellent LOOCV of 2.05% — the best prefill fit of any profile at the time
+it was calibrated. Its margin-adjusted recommendation (N=1063, 2.0% margin,
+effective budget 489.8ms) still **misses the SLA on every real run tried**:
+
+- run 1: predicted 489.6ms, measured 502.4ms (2.6% error)
+- run 2: predicted 489.6ms, measured 501.6ms (2.4% error)
+
+Both runs' real error (2.4-2.6%) is only slightly above the 2.05% LOOCV
+the margin was built from — consistently, not as an outlier. This is the
+cleanest illustration yet of the limit of this approach: LOOCV is a
+historical average error; a margin sized exactly to it will still be
+breached roughly as often as the real error exceeds that average, by
+construction. A margin meant to actually hold under real variance should
+probably use something like the LOOCV's max absolute error (or a
+multiple of its mean), not the mean itself — `PrefillBudgetTechnique`
+does not do this (yet); it's recorded here rather than silently patched
+in, since the obvious "just increase the default margin" fix would be
+tuned to these three examples, not derived from anything.
+
 ## Practical implication for the "universal tool" vision
 
 A recommendation engine that only trusts its own calibration (LOOCV) can

@@ -1,5 +1,14 @@
-"""Real llama.cpp executor: actually loads the recommended GGUF quant level
-and runs a real prefill, instead of only predicting one.
+"""Real llama.cpp executor: actually loads the recommended GGUF file and
+runs a real prefill, instead of only predicting one.
+
+Resolves which file to load entirely from the profile itself (not a
+hardcoded per-model dict): a quant_level name maps through
+profile.quant_levels[level].gguf_filename when the profile has multiple
+measured levels (e.g. Qwen2.5-0.5B), otherwise falls back to
+profile.gguf_filename (the single file auto-calibrated profiles carry).
+This is what lets the same Executor run against ANY profile -- including
+one core/calibrate.py just produced for a model this file has never heard
+of -- without new code here.
 
 Reuses the same real-call methodology as baseline/measure_llamacpp.py /
 baseline/measure_quantization_tradeoff.py (llm.eval(tokens), llm.reset()
@@ -11,18 +20,12 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 from core.executor import Executor, ExecutionResult
 from core.profile import ModelHardwareProfile
 
 MODEL_DIR = Path.home() / ".cache" / "inference_optimizer_models"
-QUANT_FILES: Dict[str, str] = {
-    "fp16": "qwen2.5-0.5b-instruct-fp16.gguf",
-    "q8_0": "qwen2.5-0.5b-instruct-q8_0.gguf",
-    "q4_k_m": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-}
-DEFAULT_QUANT_LEVEL = "q4_k_m"
 
 _FILLER = ("Please look closely at the background, the foreground, the "
            "colors, and the overall composition before answering. ")
@@ -32,23 +35,49 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def resolve_gguf_filename(profile: ModelHardwareProfile, quant_level: Optional[str]) -> str:
+    """The single place that turns (profile, quant_level) into a filename."""
+    if quant_level is not None:
+        if not profile.quant_levels or quant_level not in profile.quant_levels:
+            raise ValueError(
+                f"quant_level={quant_level!r} requested but profile "
+                f"{profile.model_id!r} has no measured data for it "
+                f"(available: {list(profile.quant_levels or {})})"
+            )
+        filename = profile.quant_levels[quant_level].gguf_filename
+        if filename is None:
+            raise ValueError(
+                f"profile {profile.model_id!r} has quant_level={quant_level!r} "
+                f"stats but no recorded gguf_filename for it"
+            )
+        return filename
+
+    if profile.gguf_filename is not None:
+        return profile.gguf_filename
+
+    raise ValueError(
+        f"profile {profile.model_id!r} has no gguf_filename and no "
+        f"quant_level was given -- nothing to load"
+    )
+
+
 class LlamaCppExecutor(Executor):
     def __init__(self):
-        self._loaded = {}  # quant_level -> Llama instance, cached across calls
+        self._loaded = {}  # (filename, n_ctx) -> Llama instance, cached across calls
 
     def supports(self, profile: ModelHardwareProfile) -> bool:
         return profile.backend == "llama.cpp"
 
-    def _get_llm(self, quant_level: str, n_ctx: int):
-        key = (quant_level, n_ctx)
+    def _get_llm(self, filename: str, n_ctx: int):
+        key = (filename, n_ctx)
         if key not in self._loaded:
             from llama_cpp import Llama
 
-            path = MODEL_DIR / QUANT_FILES[quant_level]
+            path = MODEL_DIR / filename
             if not path.exists():
                 raise FileNotFoundError(
                     f"{path} not found -- download it first (see "
-                    f"baseline/TIER2_LLAMACPP_FINDINGS.md)"
+                    f"baseline/TIER2_LLAMACPP_FINDINGS.md or core/calibrate.py)"
                 )
             self._loaded[key] = Llama(model_path=str(path), n_gpu_layers=-1,
                                        n_ctx=n_ctx, verbose=False)
@@ -71,13 +100,9 @@ class LlamaCppExecutor(Executor):
         if not self.supports(profile):
             raise ValueError(f"LlamaCppExecutor does not support backend {profile.backend!r}")
 
-        quant_level = quant_level or DEFAULT_QUANT_LEVEL
-        if quant_level not in QUANT_FILES:
-            raise ValueError(f"unknown quant_level {quant_level!r}, "
-                              f"expected one of {list(QUANT_FILES)}")
-
+        filename = resolve_gguf_filename(profile, quant_level)
         n_ctx = max(n_tokens + 64, 512)
-        llm = self._get_llm(quant_level, n_ctx)
+        llm = self._get_llm(filename, n_ctx)
         tokens = self._build_tokens(llm, n_tokens)
 
         # Discarded warm-up (shape-dependent kernel dispatch).
