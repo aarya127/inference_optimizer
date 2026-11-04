@@ -75,6 +75,12 @@ baseline/
                                    ConcurrencyThroughputTechnique's MODELED
                                    prediction (Tier 6) -- see
                                    core/TIER6_REAL_CONCURRENCY_FINDINGS.md
+  measure_llamacpp_native_batching.py  Same check via real native
+                                   multi-sequence batching (llama_batch
+                                   API) -- see core/TIER6_REAL_CONCURRENCY_FINDINGS.md
+  measure_llamacpp_prefix_cache.py Real prefix/prompt-cache reuse savings;
+                                   also where a real GPU-sync bug was found
+                                   (Tier 7) -- see core/TIER7_PREFIX_CACHE_FINDINGS.md
 model_calibration/
   cost_model.py                    Measured fit + modeled extensions
   fit_llamacpp_prefill.py          Cost-model fit for the llama.cpp profile
@@ -85,9 +91,11 @@ core/
   techniques/                     PrefillBudgetTechnique,
                                    QuantizationLevelTechnique,
                                    KVCacheBudgetTechnique,
-                                   ConcurrencyThroughputTechnique
-                                   (last one MODELED batch scaling, not
-                                   measured -- see core/README.md)
+                                   ConcurrencyThroughputTechnique (MODELED,
+                                   not measured -- see core/README.md),
+                                   ThroughputOptimalBatchTechnique,
+                                   PrefixCacheTechnique (last two REAL-data-
+                                   only, Tiers 6-7)
   executor.py, executors/         Real execution: recommend -> run for
                                    real -> compare predicted vs measured
                                    (Tier 4) -- see core/TIER4_CLOSED_LOOP_FINDINGS.md
@@ -243,11 +251,22 @@ scope/venv_phase0/bin/python integrated_service.py --api
   cross-backend pair exposed two real bugs (margin basis, an unphysical
   negative decode slope) -- both now fixed, with before/after numbers kept
 - [core/TIER6_REAL_CONCURRENCY_FINDINGS.md](core/TIER6_REAL_CONCURRENCY_FINDINGS.md)
-  — the first real check of `ConcurrencyThroughputTechnique`'s MODELED
-  concurrency prediction against actual concurrent decode throughput;
-  found substantially too optimistic (real TBT degradation ~2.3x worse
-  than predicted at B=4) -- the technique is not silently recalibrated to
-  this one result, just honestly flagged as an optimistic lower bound
+  — checks `ConcurrencyThroughputTechnique`'s MODELED concurrency
+  prediction against real decode throughput two ways: independent threads
+  (~2.3x worse than predicted at B=4) and real native multi-sequence
+  batching via llama.cpp's low-level `llama_batch` API (1.72x worse at
+  B=4, 3.26x at B=8) -- real batching helps over the naive proxy but the
+  model still substantially underestimates per-sequence compute cost; not
+  silently recalibrated to these results, just honestly flagged
+- [core/TIER7_PREFIX_CACHE_FINDINGS.md](core/TIER7_PREFIX_CACHE_FINDINGS.md)
+  — real measured prefix/prompt-cache reuse savings (46-68% prefill time
+  saved depending on suffix length), and more importantly a real
+  GPU-dispatch synchronization bug found while measuring it: `llama_decode()`
+  can return before its GPU work finishes, silently corrupting timing that
+  interleaves different shapes -- the same class of bug, independently
+  rediscovered, that originally motivated this project's MLX honesty
+  rewrite. Whether it affects this repo's other llama.cpp timing scripts
+  is flagged as an open, unverified risk, not assumed either way.
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

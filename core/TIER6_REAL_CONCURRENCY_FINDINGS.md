@@ -59,28 +59,105 @@ smoothed over.
 
 ## Conclusion: don't trust `ConcurrencyThroughputTechnique`'s numbers for capacity planning
 
-Given this real/modeled gap (as much as 2.3x too optimistic at B=4, in
-this one setup), `core/techniques/concurrency_throughput.py`'s own
-docstring and `core/README.md` are updated to point here. The technique
-itself is NOT rewritten to fit this one real measurement — that would
-mean re-calibrating a formula to a single (model, backend, ctx, threading
-strategy) data point, which risks being just as wrong for a different
-setup (a real multi-sequence batched server, a different model size, a
-different ctx). The honest state of this technique is: it is a documented
-extrapolation that has now been checked once against reality and found to
-understate real-world contention substantially — treat its output as a
-lower bound on TBT degradation, not an estimate, until it is recalibrated
-against real multi-sequence serving data (ideally via llama.cpp's actual
-`llama_batch` API, which was out of scope here).
+Checked against both an independent-threads proxy (2.3x too optimistic at
+B=4) and, now, the real native-batching scenario it was actually meant to
+predict (1.72x too optimistic at B=4, 3.26x at B=8, and growing) —
+`concurrency_throughput.py`'s own docstring and `core/README.md` are
+updated to point here. The technique itself is NOT rewritten to fit these
+measurements — that would mean fitting a formula to 4 (B, ctx) points at
+one model size, which risks being just as wrong for a different model or
+context length (see "What's still open" above). The honest state of this
+technique is: it is a documented extrapolation that has now been checked
+against reality twice, by two different real methods, and found to
+understate real-world contention substantially both times — treat its
+output as a lower bound on TBT degradation, not an estimate, until a
+proper compute-aware cost model replaces it.
 
-## What would resolve this properly
+## Follow-up: real native batching, via the low-level `llama_batch` API
 
-1. Measure real server-side continuous batching (llama.cpp's low-level
-   `llama_batch` API, or just running `llama-server` and sending B
-   concurrent HTTP requests) instead of B independent contexts — this
-   is the scenario `ConcurrencyThroughputTechnique` is actually meant to
-   predict, and this experiment did not test it.
-2. Instrument GPU utilization (e.g. `powermetrics`) during the concurrent
-   run to distinguish GIL-bound from GPU-queue-bound serialization.
-3. Repeat at larger B and larger ctx to see whether the measured/modeled
-   gap grows, shrinks, or stays proportionally similar.
+The independent-contexts experiment above explicitly was not the scenario
+`ConcurrencyThroughputTechnique` is meant to predict (continuous-batching
+servers share one KV cache and submit one combined `llama_decode` call per
+step across sequences). `baseline/measure_llamacpp_native_batching.py`
+measures that scenario for real, using llama.cpp's low-level `llama_batch`
+API directly: one context, one shared KV cache sliced across B sequence
+IDs, one `llama_decode` call per step covering all B sequences.
+
+**This required a real workaround, documented for anyone extending this
+further**: `llama-cpp-python`'s high-level `Llama` class hardcodes
+`n_seq_max=1` (the number of independent sequences one context supports)
+unless `embedding=True`, with no public constructor parameter to raise it.
+The only way found to override it without reimplementing `Llama.__init__`
+is to monkey-patch `llama_cpp.llama_cpp.llama_context_default_params`
+(the exact submodule `llama.py` imports it as — patching the top-level
+`llama_cpp.llama_context_default_params` does nothing, since
+`from X import *`-style re-exports don't alias back) for the duration of
+construction. See `_make_multi_seq_llama()` in the script.
+
+**Correctness was verified before trusting any timing**, not assumed: two
+sequences given different prompts ("The capital of France is" / "The
+largest planet is") correctly and independently completed as "...Paris..."
+and "...Jupiter, which is about 1[1 times the size of Earth]...",
+including over multiple subsequent decode steps, with zero cross-sequence
+contamination. A first version of the script also crashed outright at
+B=8 with a native `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` abort
+(from prefilling all B sequences in one combined batch exceeding
+`n_batch`) — a real bug, fixed by prefilling one sequence per
+`llama_decode` call instead of all B combined, with incremental JSON
+writes added afterward so a future crash at one B doesn't lose already-
+measured results from lower B values, since a native abort skips any
+Python code after it, including a final save.
+
+### Three-way result
+
+| B | MODELED (ms) | measured: independent threads (ms) | measured: native batched (ms) | native/modeled |
+|---|---|---|---|---|
+| 1 | 11.50 | 16.54 (outlier-skewed; ~7.25 steady-state) | 7.95 | 0.69x |
+| 2 | 11.60 | 13.74 | 12.18 | 1.05x |
+| 4 | 11.81 | 27.17 | 20.31 | 1.72x |
+| 8 | 12.23 | *(not tested)* | 39.92 | **3.26x** |
+
+**Native batching is real and helps** — it is consistently and
+substantially faster than the independent-threads proxy at every B tested
+(e.g. 20.31ms vs 27.17ms at B=4), confirming that real GPU-level batching
+does provide a genuine throughput benefit over naively running independent
+contexts. But it is **still far from the MODELED "near-flat" prediction**:
+3.26x worse at B=8, and growing with B, not shrinking.
+
+A quick linear fit to the native-batched data (TBT(B) ≈ 3.4 + 4.6×B ms)
+fits all four points well (predicts 12.5ms at B=2, 21.7ms at B=4, vs.
+measured 12.2ms and 20.3ms) — a per-extra-sequence marginal cost around
+**4.6ms**, roughly **44x** the model's assumed 0.105ms/sequence
+KV-bandwidth-only cost. This points to the actual mechanism the model
+misses: decode for a 360M model at small batch sizes is not purely
+memory-bandwidth-bound the way the model assumes — each additional
+sequence in the batch adds real per-sequence compute (a full forward pass
+worth of FLOPs), and at these batch sizes that compute cost, not KV-cache
+bandwidth, is the dominant term. This is the same roofline
+compute-vs-bandwidth distinction `simulation/w4a8_quantizer.py`'s honesty
+rewrite already identified for this repo's *other* decode model
+(`core/TIER2_LLAMACPP_FINDINGS.md`'s quantization findings) — same
+underlying physics, independently rediscovered here via direct
+measurement rather than re-used as an assumption.
+
+## What's still open
+
+1. ~~Measure real server-side continuous batching~~ — done above, via the
+   low-level `llama_batch` API. Confirms the gap is real, not an artifact
+   of the independent-threads proxy (smaller gap, same direction, still
+   substantial and growing with B).
+2. A proper compute-vs-bandwidth cost model for decode (e.g.
+   `TBT(ctx, B) ≈ overhead + per_ctx_token*ctx + per_sequence_compute*B`,
+   fit to real multi-B measurements like these) would fix
+   `ConcurrencyThroughputTechnique`'s core assumption. Not attempted here
+   — fitting a corrected formula to only 4 (B, ctx) points at one model
+   size and one context length risks the same overfitting-to-one-setup
+   problem already flagged for the margin fix elsewhere in this repo; it
+   would need a proper multi-ctx, multi-model sweep first.
+3. Repeat at larger B, larger ctx, and a second model to see whether the
+   ~4.6ms/sequence marginal cost found here is a property of this model
+   size or holds more generally.
+4. Instrument GPU utilization (e.g. `powermetrics`) to directly attribute
+   the per-sequence marginal cost to compute vs. any remaining
+   coordination/dispatch overhead, rather than inferring it from the
+   roofline argument alone.

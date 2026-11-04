@@ -11,13 +11,16 @@ from core.profile import load_all_profiles
 from core.techniques.concurrency_throughput import ConcurrencyThroughputTechnique
 from core.techniques.kv_cache_budget import KVCacheBudgetTechnique
 from core.techniques.prefill_budget import PrefillBudgetTechnique
+from core.techniques.prefix_cache import PrefixCacheTechnique
 from core.techniques.quantization_level import QuantizationLevelTechnique
+from core.techniques.throughput_optimal_batch import ThroughputOptimalBatchTechnique
 
 
 def main():
     profiles = load_all_profiles()
     techniques = [PrefillBudgetTechnique(), QuantizationLevelTechnique(),
-                  KVCacheBudgetTechnique(), ConcurrencyThroughputTechnique()]
+                  KVCacheBudgetTechnique(), ConcurrencyThroughputTechnique(),
+                  ThroughputOptimalBatchTechnique(), PrefixCacheTechnique()]
 
     for profile_name, profile in profiles.items():
         print(f"\n{'=' * 70}")
@@ -44,6 +47,15 @@ def main():
             elif tech.name == "concurrency_throughput":
                 rec = tech.recommend(profile, tbt_sla_ms=50.0, ctx_tokens=1024.0)
                 print(f"  tbt_sla=50ms, ctx=1024 -> {rec.rationale}")
+            elif tech.name == "throughput_optimal_batch":
+                rec = tech.recommend(profile)
+                print(f"  unconstrained -> {rec.rationale}")
+                rec = tech.recommend(profile, max_tbt_ms=15.0)
+                print(f"  max_tbt_ms=15 -> {rec.rationale}")
+            elif tech.name == "prefix_cache_savings":
+                for suffix in (50, 100, 200):
+                    rec = tech.recommend(profile, suffix_tokens=suffix)
+                    print(f"  suffix_tokens={suffix} -> {rec.rationale}")
 
 
 if __name__ == "__main__":

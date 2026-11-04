@@ -70,6 +70,19 @@ they're the only two techniques worth having:
   at 1548 ctx), generalized to any profile's real `kv_bytes_per_token` and
   `bandwidth_gbps` — applied to both profiles with the same honest label,
   not asserted as a measurement for either.
+- `ThroughputOptimalBatchTechnique` — which measured batch size maximizes
+  total tokens/sec, from REAL native-batching data only
+  (`ModelHardwareProfile.concurrency_measurements`, Tier 6). Never
+  extrapolates beyond batch sizes actually measured, and respects an
+  optional per-sequence latency cap. Applies only to
+  `smollm2_360m_llamacpp_profile` — the only profile with real
+  multi-sequence batching data.
+- `PrefixCacheTechnique` — real measured savings from reusing a cached
+  prefix (e.g. a system prompt) across requests
+  (`ModelHardwareProfile.prefix_cache_measurements`, Tier 7). Also applies
+  only to `smollm2_360m_llamacpp_profile`, and only at the exact suffix
+  lengths measured — see `TIER7_PREFIX_CACHE_FINDINGS.md`, which also
+  documents a real GPU-synchronization bug found while building this.
 
 ## Usage
 
@@ -177,27 +190,61 @@ text. Full detail in `TIER5_AUTO_ONBOARDING_FINDINGS.md`.
 
 `ConcurrencyThroughputTechnique` had never been checked against a real
 multi-sequence run — it was a MODELED extension of batch=1 decode data
-from day one. `baseline/measure_llamacpp_concurrency.py` measures real
-concurrent-decode throughput (B independent llama.cpp contexts, Python
-threads, SmolLM2-360M) and compares it against the technique's prediction
-for the same B and context length. Result: the technique is **substantially
-too optimistic** — it predicts near-flat TBT scaling (11.5ms → 11.8ms from
-B=1 to B=4, since it only models KV-bandwidth contention) while the real
-measurement showed close to linear degradation (~27ms at B=4, 2.3x worse
-than predicted), most likely from GIL or GPU-command-queue serialization
-the model doesn't account for. Not recalibrated to this one data point —
-the technique's docstring and `core/TIER6_REAL_CONCURRENCY_FINDINGS.md`
-now say plainly to treat its output as an optimistic lower bound, not an
-estimate, until validated for a given real deployment.
+from day one. Checked two ways, both showing it is **substantially too
+optimistic**:
+
+1. `baseline/measure_llamacpp_concurrency.py` — B independent llama.cpp
+   contexts, Python threads (a proxy, not real batching): ~2.3x worse than
+   predicted at B=4.
+2. `baseline/measure_llamacpp_native_batching.py` — the real scenario the
+   technique is meant to predict: one context, one shared KV cache, real
+   native multi-sequence batching via llama.cpp's low-level `llama_batch`
+   API (required monkey-patching `n_seq_max`, llama-cpp-python's high-level
+   `Llama` class hardcodes it to 1; correctness verified by confirming two
+   differently-prompted sequences completed correctly and independently
+   across multiple decode steps before trusting any timing). Real batching
+   *does* help — consistently faster than the independent-threads proxy —
+   but is still **1.72x worse at B=4 and 3.26x worse at B=8** than the
+   model's near-flat prediction (11.5ms → 11.8ms from B=1 to B=4, since it
+   only models KV-bandwidth contention). A linear fit to the real data
+   implies a ~4.6ms per-extra-sequence marginal cost — ~44x the model's
+   assumed 0.105ms — because decode compute, not just KV-bandwidth, scales
+   with batch size at these sizes, something the model ignores entirely.
+
+Not recalibrated to these 4 data points at one model size — the
+technique's docstring and `core/TIER6_REAL_CONCURRENCY_FINDINGS.md` now
+say plainly to treat its output as an optimistic lower bound, not an
+estimate, until a proper compute-aware cost model replaces it.
+
+## Tier 7: a new technique, and a real synchronization bug
+
+`PrefixCacheTechnique` (above) reports REAL measured prefix/prompt-cache
+reuse savings (e.g. 67.9% prefill time saved on a 50-token suffix when a
+200-token prefix is already cached). Building its underlying measurement
+(`baseline/measure_llamacpp_prefix_cache.py`) surfaced something more
+important than the technique itself: `llama_decode()` can return to Python
+before its Metal GPU work has actually finished, so timing a bare `eval()`
+call without forcing synchronization can silently misattribute one call's
+compute to whichever call happens to force a sync next. This was invisible
+in every prior script in this repo (always the same shape, repeated in a
+loop) and only became obvious once two *different* shapes were interleaved
+in one measurement. Fixed here by reading a logit (a real synchronization
+point) after every timed `eval()`. This is the same class of bug,
+independently rediscovered, that originally motivated this project's
+entire honesty rewrite on the MLX side (`mx.eval()` called with no
+arguments, synchronizing nothing). **Whether this affects this repo's
+other llama.cpp timing scripts is an open, unresolved question** — not
+confirmed broken, not confirmed safe. Full writeup, including that open
+risk, in `TIER7_PREFIX_CACHE_FINDINGS.md`.
 
 ## What this is not (yet)
 
-This is a proof of the abstraction on four profiles, four techniques, and
+This is a proof of the abstraction on five profiles, six techniques, and
 three executors — not a general driver that loads arbitrary HuggingFace
 models on arbitrary backends, and not a production autotuner (still no
 automatic recalibration when a closed-loop check disagrees with the cost
 model — the margin is a static, LOOCV-derived buffer, not a response to
 live results). Extending it further (automatic margin tuning from
-closed-loop history, a real CUDA backend/profile, real batching/scheduling
-techniques measured against a real engine) is future work; see the main
-README's roadmap.
+closed-loop history, a real CUDA backend/profile, a systematic audit of
+every llama.cpp script's GPU synchronization, real speculative decoding)
+is future work; see the main README's roadmap.

@@ -31,6 +31,8 @@ from core.techniques.concurrency_throughput import ConcurrencyThroughputTechniqu
 from core.techniques.kv_cache_budget import KVCacheBudgetTechnique
 from core.techniques.prefill_budget import PrefillBudgetTechnique
 from core.techniques.quantization_level import QuantizationLevelTechnique
+from core.techniques.throughput_optimal_batch import ThroughputOptimalBatchTechnique
+from core.techniques.prefix_cache import PrefixCacheTechnique
 
 QWEN_FIT = _ROOT / "model_calibration" / "llamacpp_prefill_fit.json"
 QUANT_DATA = _ROOT / "baseline" / "results_quantization_tradeoff.json"
@@ -44,6 +46,18 @@ requires_quant_data = pytest.mark.skipif(
     not QUANT_DATA.exists(),
     reason="baseline/results_quantization_tradeoff.json not present -- run "
            "baseline/measure_quantization_tradeoff.py first",
+)
+NATIVE_BATCHING_DATA = _ROOT / "baseline" / "results_llamacpp_native_batching.json"
+requires_native_batching_data = pytest.mark.skipif(
+    not NATIVE_BATCHING_DATA.exists(),
+    reason="baseline/results_llamacpp_native_batching.json not present -- run "
+           "baseline/measure_llamacpp_native_batching.py first",
+)
+PREFIX_CACHE_DATA = _ROOT / "baseline" / "results_llamacpp_prefix_cache.json"
+requires_prefix_cache_data = pytest.mark.skipif(
+    not PREFIX_CACHE_DATA.exists(),
+    reason="baseline/results_llamacpp_prefix_cache.json not present -- run "
+           "baseline/measure_llamacpp_prefix_cache.py first",
 )
 
 
@@ -334,3 +348,94 @@ def test_concurrency_throughput_reports_zero_when_batch1_already_over_sla():
     rec = tech.recommend(profile, tbt_sla_ms=0.001, ctx_tokens=1024.0)
     assert rec.applicable
     assert rec.choice == 0
+
+
+def test_throughput_optimal_batch_not_applicable_without_real_data():
+    """Every profile except smollm2_360m_llamacpp_profile has no real
+    native-batching measurements -- must say so, not guess from the
+    MODELED ConcurrencyThroughputTechnique's numbers."""
+    tech = ThroughputOptimalBatchTechnique()
+    profile = load_smolvlm_mlx_profile()
+    assert tech.applies_to(profile) is False
+    rec = tech.recommend(profile)
+    assert rec.applicable is False
+
+
+@requires_native_batching_data
+def test_throughput_optimal_batch_respects_latency_constraint():
+    from core.profile import load_all_profiles
+
+    profile = load_all_profiles()["smollm2_360m_llamacpp_profile"]
+    tech = ThroughputOptimalBatchTechnique()
+    assert tech.applies_to(profile)
+
+    unconstrained = tech.recommend(profile)
+    assert unconstrained.applicable and unconstrained.choice is not None
+
+    # A tight per-sequence TBT cap must exclude higher batch sizes even
+    # though they'd otherwise win on raw throughput.
+    constrained = tech.recommend(profile, max_tbt_ms=15.0)
+    assert constrained.applicable and constrained.choice is not None
+    assert constrained.choice <= unconstrained.choice
+    matching = next(c for c in profile.concurrency_measurements
+                     if c.batch_size == constrained.choice)
+    assert matching.measured_tbt_ms <= 15.0
+
+
+@requires_native_batching_data
+def test_throughput_optimal_batch_never_recommends_unmeasured_batch_size():
+    from core.profile import load_all_profiles
+
+    profile = load_all_profiles()["smollm2_360m_llamacpp_profile"]
+    tech = ThroughputOptimalBatchTechnique()
+    rec = tech.recommend(profile)
+    measured_sizes = {c.batch_size for c in profile.concurrency_measurements}
+    assert rec.choice in measured_sizes
+
+
+def test_prefix_cache_not_applicable_without_real_data():
+    tech = PrefixCacheTechnique()
+    profile = load_smolvlm_mlx_profile()
+    assert tech.applies_to(profile) is False
+    rec = tech.recommend(profile, suffix_tokens=50)
+    assert rec.applicable is False
+
+
+@requires_prefix_cache_data
+def test_prefix_cache_reports_real_measured_savings():
+    from core.profile import load_all_profiles
+
+    profile = load_all_profiles()["smollm2_360m_llamacpp_profile"]
+    tech = PrefixCacheTechnique()
+    assert tech.applies_to(profile)
+
+    rec = tech.recommend(profile, suffix_tokens=50)
+    assert rec.applicable
+    # Savings should be substantial and positive (caching a 200-token
+    # prefix for a much shorter 50-token suffix) but physically bounded.
+    assert 0.0 < rec.estimated_value < 100.0
+    assert "MEASURED" in rec.rationale
+
+
+@requires_prefix_cache_data
+def test_prefix_cache_does_not_extrapolate_to_unmeasured_suffix_length():
+    from core.profile import load_all_profiles
+
+    profile = load_all_profiles()["smollm2_360m_llamacpp_profile"]
+    tech = PrefixCacheTechnique()
+    rec = tech.recommend(profile, suffix_tokens=12345)
+    assert rec.applicable is True
+    assert rec.choice is None
+    assert "not directly measured" in rec.rationale
+
+
+@requires_prefix_cache_data
+def test_prefix_cache_savings_decrease_as_suffix_grows():
+    """A fixed prefix's absolute savings become a smaller fraction of
+    total cost as the suffix grows -- the real measured data should show
+    this, not a flat or increasing percentage."""
+    from core.profile import load_all_profiles
+
+    profile = load_all_profiles()["smollm2_360m_llamacpp_profile"]
+    by_suffix = {m.suffix_tokens: m.savings_pct for m in profile.prefix_cache_measurements}
+    assert by_suffix[50] > by_suffix[100] > by_suffix[200]

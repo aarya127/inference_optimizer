@@ -83,6 +83,28 @@ class QuantLevelStats:
 
 
 @dataclass(frozen=True)
+class ConcurrencyPoint:
+    """One REAL measured (batch_size, TBT) point from a native multi-
+    sequence batching run (core/TIER6_REAL_CONCURRENCY_FINDINGS.md) --
+    not the modeled extrapolation ConcurrencyThroughputTechnique produces.
+    """
+    batch_size: int
+    ctx_tokens: int
+    measured_tbt_ms: float
+
+
+@dataclass(frozen=True)
+class PrefixCacheMeasurement:
+    """One REAL measured (prefix_len, suffix_len) -> savings point
+    (core/TIER7_PREFIX_CACHE_FINDINGS.md), not a prediction."""
+    prefix_tokens: int
+    suffix_tokens: int
+    cold_ms: float
+    warm_ms: float
+    savings_pct: float
+
+
+@dataclass(frozen=True)
 class ModelHardwareProfile:
     model_id: str
     backend: str      # e.g. "mlx", "llama.cpp"
@@ -102,6 +124,13 @@ class ModelHardwareProfile:
     # multiple measured quant levels instead resolve a filename per level
     # via quant_levels[level].gguf_filename.
     gguf_filename: Optional[str] = None
+    # REAL native multi-sequence batching measurements (Tier 6), when they
+    # exist for this profile -- absent, not modeled, otherwise. Powers
+    # ThroughputOptimalBatchTechnique.
+    concurrency_measurements: Optional[Tuple[ConcurrencyPoint, ...]] = None
+    # REAL prefix/prompt-cache reuse measurements (Tier 7), when they exist
+    # for this profile. Powers PrefixCacheTechnique.
+    prefix_cache_measurements: Optional[Tuple[PrefixCacheMeasurement, ...]] = None
 
 
 def load_smolvlm_mlx_profile() -> ModelHardwareProfile:
@@ -248,6 +277,70 @@ def load_profile_from_calibration_json(path) -> ModelHardwareProfile:
     )
 
 
+def _enrich_with_concurrency_measurements(
+    profiles: Dict[str, ModelHardwareProfile]
+) -> Dict[str, ModelHardwareProfile]:
+    """Attach REAL native-batching measurements (core/TIER6_REAL_CONCURRENCY_FINDINGS.md)
+    to whichever profile they were measured against, matched by GGUF
+    filename -- there is currently exactly one such result file, for
+    smollm2_360m_llamacpp_profile. Absent for every other profile, not
+    modeled or guessed."""
+    import dataclasses
+
+    results_path = ROOT / "baseline" / "results_llamacpp_native_batching.json"
+    if not results_path.exists():
+        return profiles
+
+    data = json.loads(results_path.read_text())
+    model_file = data["meta"]["model_file"]
+    points = tuple(
+        ConcurrencyPoint(
+            batch_size=r["concurrency"],
+            ctx_tokens=r["ctx_tokens"],
+            measured_tbt_ms=r["effective_tbt_ms"]["mean"],
+        )
+        for r in data["runs"]
+    )
+
+    for name, profile in profiles.items():
+        if profile.gguf_filename == model_file:
+            profiles[name] = dataclasses.replace(
+                profile, concurrency_measurements=points)
+    return profiles
+
+
+def _enrich_with_prefix_cache_measurements(
+    profiles: Dict[str, ModelHardwareProfile]
+) -> Dict[str, ModelHardwareProfile]:
+    """Attach REAL prefix-cache measurements (core/TIER7_PREFIX_CACHE_FINDINGS.md)
+    to whichever profile they were measured against, matched by GGUF
+    filename -- same enrichment pattern as _enrich_with_concurrency_measurements."""
+    import dataclasses
+
+    results_path = ROOT / "baseline" / "results_llamacpp_prefix_cache.json"
+    if not results_path.exists():
+        return profiles
+
+    data = json.loads(results_path.read_text())
+    model_file = data["meta"]["model_file"]
+    points = tuple(
+        PrefixCacheMeasurement(
+            prefix_tokens=p["prefix_tokens"],
+            suffix_tokens=p["suffix_tokens"],
+            cold_ms=p["cold_ms"]["mean"],
+            warm_ms=p["warm_suffix_only_ms"]["mean"],
+            savings_pct=p["savings_pct"],
+        )
+        for p in data["points"]
+    )
+
+    for name, profile in profiles.items():
+        if profile.gguf_filename == model_file:
+            profiles[name] = dataclasses.replace(
+                profile, prefix_cache_measurements=points)
+    return profiles
+
+
 def load_all_profiles() -> Dict[str, ModelHardwareProfile]:
     profiles = {"smolvlm_mlx": load_smolvlm_mlx_profile()}
     try:
@@ -267,4 +360,7 @@ def load_all_profiles() -> Dict[str, ModelHardwareProfile]:
                 profiles[f.stem] = load_profile_from_calibration_json(f)
             except Exception as e:
                 print(f"warning: failed to load {f}: {e}")
+
+    profiles = _enrich_with_concurrency_measurements(profiles)
+    profiles = _enrich_with_prefix_cache_measurements(profiles)
     return profiles

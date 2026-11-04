@@ -13,17 +13,24 @@ question from KVCacheBudgetTechnique: that one asks "how much context fits
 in memory"; this one asks "how many sequences can decode together before
 the SLA breaks", assuming memory is not the binding constraint.
 
-CHECKED AGAINST REALITY ONCE (core/TIER6_REAL_CONCURRENCY_FINDINGS.md) AND
-FOUND SUBSTANTIALLY TOO OPTIMISTIC: a real concurrent-decode measurement
-(B independent llama.cpp contexts, SmolLM2-360M, ctx=256) showed close to
-LINEAR TBT degradation with B (measured ~2.3x worse than this formula
-predicts at B=4), because this model only accounts for KV-bandwidth
-contention and ignores compute/GIL/GPU-queue serialization, which
-dominated in that measurement. Not recalibrated to that single data point
-(a different setup -- real batched serving, a bigger model, more
-sequences -- could show a different gap) -- treat this technique's output
-as an optimistic lower bound on TBT degradation, not an estimate, until
-validated for your specific (model, backend, serving strategy).
+CHECKED AGAINST REALITY TWICE (core/TIER6_REAL_CONCURRENCY_FINDINGS.md) AND
+FOUND SUBSTANTIALLY TOO OPTIMISTIC BOTH TIMES: an independent-contexts
+proxy measurement (SmolLM2-360M, ctx=256) showed ~2.3x worse TBT than this
+formula predicts at B=4. The real scenario this technique is meant to
+predict -- one context, one shared KV cache, real native multi-sequence
+batching via llama.cpp's low-level llama_batch API -- was then measured
+directly and was ALSO substantially worse than predicted, just less so:
+1.72x at B=4, 3.26x at B=8, and growing with B. A linear fit to the real
+native-batched data implies a per-extra-sequence marginal cost around
+4.6ms -- roughly 44x this formula's assumed 0.105ms/sequence
+KV-bandwidth-only cost -- because decode at these batch sizes is not
+purely bandwidth-bound the way this formula assumes: each additional
+sequence adds real per-sequence COMPUTE the formula ignores entirely. Not
+recalibrated to these 4 (B, ctx) points at one model size (a different
+model or context length could show a different gap) -- treat this
+technique's output as an optimistic lower bound on TBT degradation, not an
+estimate, until validated for your specific (model, backend, serving
+strategy).
 """
 
 from __future__ import annotations

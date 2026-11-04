@@ -1,0 +1,72 @@
+{
+  "meta": {
+    "model_file": "SmolLM2-360M-Instruct-Q4_K_M.gguf",
+    "method": "ONE context, ONE shared KV cache sliced across B seq_ids via the low-level llama_batch API (llama_batch_init / llama_decode with per-token seq_id) -- real continuous-batching-style execution, one llama_decode call per step covering all B sequences. Verified correct (not just crash-free) before use: see module docstring. Effective TBT/sequence = wall time for n_steps combined decode calls / n_steps."
+  },
+  "runs": [
+    {
+      "concurrency": 1,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 7.947675839265187,
+        "std": 0.9520607996037526,
+        "trials_ms": [
+          7.303394466638565,
+          9.37943056623141,
+          7.812808332840602,
+          8.303106931845347,
+          6.939638898770014
+        ]
+      }
+    },
+    {
+      "concurrency": 2,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 12.175288333495457,
+        "std": 0.704337663030659,
+        "trials_ms": [
+          11.081866667668026,
+          12.14232916633288,
+          12.803388899564743,
+          12.057647200425466,
+          12.791209733486175
+        ]
+      }
+    },
+    {
+      "concurrency": 4,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 20.312563620011012,
+        "std": 0.4813176327643776,
+        "trials_ms": [
+          20.1295486330986,
+          20.075045833985012,
+          20.081131966908774,
+          20.104379167159397,
+          21.172712498903273
+        ]
+      }
+    },
+    {
+      "concurrency": 8,
+      "ctx_tokens": 256,
+      "n_steps": 30,
+      "effective_tbt_ms": {
+        "mean": 39.917287493944166,
+        "std": 0.48788839281018415,
+        "trials_ms": [
+          40.19687636693319,
+          39.222355568408965,
+          39.657165267070134,
+          40.03678886691729,
+          40.47325140039126
+        ]
+      }
+    }
+  ]
+}
