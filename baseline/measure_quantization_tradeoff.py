@@ -104,20 +104,40 @@ def build_filler_tokens(llm, n_tokens: int) -> list[int]:
     return toks[:n_tokens]
 
 
+def _sync(llm) -> None:
+    """Block until the most recent eval()'s GPU work has finished
+    (llama_get_logits_ith() calls llama_synchronize() first). Needed on the
+    logits_all=False timing instance: there, eval() reads no logits and
+    llama_decode() returns before its Metal work completes. See
+    core/SYNC_AUDIT_FINDINGS.md."""
+    llm._ctx.get_logits_ith(-1)
+
+
 def measure_one_level(name: str, path: Path, n_ctx: int, trials: int) -> dict:
     from llama_cpp import Llama
 
     file_size_mb = path.stat().st_size / 2**20
     print(f"\n=== {name}  ({file_size_mb:.1f} MiB on disk) ===")
 
+    # Perplexity needs every position's logits (logits_all=True), but that
+    # makes every eval() copy n_tokens x n_vocab floats (1024 x 151936 x 4B
+    # ~= 620MB for Qwen2.5) into Python -- an earlier version timed prefill
+    # on this same instance, so its "prefill" numbers were inflated ~45-75%
+    # by that copy over real compute time, and swung by seconds under memory pressure on this
+    # 8GB machine. So: score perplexity on a logits_all=True instance, free
+    # it, then time on a separate logits_all=False instance (the
+    # configuration a real deployment would actually run).
+    ppl_llm = Llama(model_path=str(path), n_gpu_layers=-1, n_ctx=n_ctx,
+                    verbose=False, logits_all=True)
+    perplexity = measure_perplexity(ppl_llm)
+    print(f"  perplexity (fixed reference passage): {perplexity:.3f}")
+    del ppl_llm
+
     t0 = _now_ms()
     llm = Llama(model_path=str(path), n_gpu_layers=-1, n_ctx=n_ctx,
-                verbose=False, logits_all=True)
+                verbose=False, logits_all=False)
     load_ms = _now_ms() - t0
     print(f"  load: {load_ms:.0f} ms")
-
-    perplexity = measure_perplexity(llm)
-    print(f"  perplexity (fixed reference passage): {perplexity:.3f}")
 
     prefill_by_n = {}
     for n_tok in TOKEN_COUNTS:
@@ -125,12 +145,14 @@ def measure_one_level(name: str, path: Path, n_ctx: int, trials: int) -> dict:
         # per-shape warm-up (discarded)
         llm.reset()
         llm.eval(tokens)
+        _sync(llm)
 
         times = []
         for _ in range(trials):
             llm.reset()
             t0 = _now_ms()
             llm.eval(tokens)
+            _sync(llm)
             times.append(_now_ms() - t0)
         prefill_by_n[str(n_tok)] = _summ(times)
         print(f"  prefill N={n_tok}: {_summ(times)['mean_ms']:.1f} ms")
@@ -141,6 +163,7 @@ def measure_one_level(name: str, path: Path, n_ctx: int, trials: int) -> dict:
         t0 = _now_ms()
         tok = llm.sample()
         llm.eval([tok])
+        _sync(llm)
         tbt.append(_now_ms() - t0)
     tbt_summary = _summ(tbt)
     print(f"  decode TBT: {tbt_summary['mean_ms']:.1f} ms")
@@ -178,6 +201,12 @@ def main():
                                   "unexplained 569 'tokens' for a 23-token "
                                   "sentence during development and was "
                                   "rejected as untrustworthy.",
+            "timing_method": "prefill/decode timed on a SEPARATE "
+                             "logits_all=False instance (perplexity's "
+                             "logits_all=True would add an n x vocab logits "
+                             "copy to every timed eval), with an explicit "
+                             "GPU sync (llama_get_logits_ith) after every "
+                             "timed eval() -- see core/SYNC_AUDIT_FINDINGS.md.",
         },
         "levels": {},
     }

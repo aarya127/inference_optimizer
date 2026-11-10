@@ -12,10 +12,19 @@ with full Metal GPU offload (`n_gpu_layers=-1`) on the same M3 used
 throughout this study. A genuinely different model (different architecture,
 size, and quantization scheme) on a genuinely different inference engine —
 not a re-export of SmolVLM's LM. See `baseline/measure_llamacpp.py` for the
-method (`llm.eval(tokens)` for prefill — synchronous, no MLX-style lazy-eval
-trap to guard against — `llm.reset()` between trials, 1 discarded per-shape
+method (`llm.eval(tokens)` for prefill, followed by an explicit GPU sync —
+`llama_decode()` turned out NOT to be synchronous on Metal, see
+`core/SYNC_AUDIT_FINDINGS.md` — `llm.reset()` between trials, 1 discarded per-shape
 warm-up, 8 timed trials/point) and `model_calibration/fit_llamacpp_prefill.py`
 for the fit.
+
+> **Re-measured after the sync-bug audit ([core/SYNC_AUDIT_FINDINGS.md](../core/SYNC_AUDIT_FINDINGS.md)).**
+> Decode TBT was inflated by the preceding prefill leaking into the first
+> timed decode step (fake per-context slope), and the quantization
+> prefill numbers included a ~620 MB logits copy. The numbers below are
+> the corrected re-run, with originals noted. **The corrected
+> quantization numbers reverse one conclusion:** q4_k_m prefill is
+> *slower* than fp16, not slightly faster.
 
 **This is NOT a speed comparison.** Different model size, architecture, and
 quantization make raw latency numbers incomparable across the two studies.
@@ -30,17 +39,24 @@ this measurement session had no other heavy process sharing the machine.
 | | SmolVLM/MLX (4 points, N in [100,1560]) | Qwen2.5-0.5B/llama.cpp (10 points, N in [32,2048]) |
 |---|---|---|
 | R² (in-sample) | 0.9996 | 0.9996 |
-| MAPE (in-sample) | 3.01% | 2.30% |
-| MAPE (LOOCV) | **20.7%** | **5.72%** |
-| alpha (intercept) | 244.60 ms (positive) | 5.58 ms (positive) |
+| MAPE (in-sample) | 3.01% | 1.17% (was 2.30%) |
+| MAPE (LOOCV) | **20.7%** | **1.68%** (was 5.72%) |
+| alpha (intercept) | 244.60 ms (positive) | 6.96 ms (positive; was 5.58) |
 
-Fitted: `T_prefill(N) = 4.9248e-05*N^2 + 0.37296*N + 5.58` ms.
+Fitted: `T_prefill(N) = 5.1704e-05*N^2 + 0.37606*N + 6.96` ms (was
+`4.9248e-05*N^2 + 0.37296*N + 5.58`). The prefill change is mostly
+run-to-run variation, not the sync fix (same-shape prefill loops
+self-corrected; see the audit). LOOCV max error fell from 31.7% to 3.4%,
+but that does not mean the model is that accurate between grid points:
+prefill has a ~26–33 ms step at every 512-token `n_batch` boundary, and
+this grid never samples just past one (audit §6).
 
 Decode TBT (batch=1) also replicates the qualitative SmolVLM finding —
 small fixed overhead + a small linear per-context-token term, i.e. decode
 is memory-bandwidth-bound and roughly flat, not the binding constraint:
 
-    Qwen2.5-0.5B/llama.cpp:  TBT(ctx) ~= 10.26 + 0.00446*ctx  ms
+    Qwen2.5-0.5B/llama.cpp:  TBT(ctx) ~= 9.03 + 0.00167*ctx  ms   (was 10.26 + 0.00446*ctx,
+                                                                 inflated by the sync bug)
     SmolVLM/MLX:             TBT(ctx) ~= 18.33 + 0.00320*ctx  ms
 
 ## Interpretation
@@ -48,7 +64,7 @@ is memory-bandwidth-bound and roughly flat, not the binding constraint:
 1. **The quadratic form generalizes.** A second model on a second backend
    fits the same functional form just as well in-sample (R²=0.9996) and,
    with enough well-conditioned points, validates far better under LOOCV
-   (5.72% vs 20.7%). This corroborates `PREFILL_V3_FINDINGS.md`'s
+   (1.68%, originally 5.72%, vs 20.7%). This corroborates `PREFILL_V3_FINDINGS.md`'s
    conclusion that the SmolVLM study's 20.7% LOOCV gap is a data-density /
    measurement-condition limitation (only 4 points, one run confounded by a
    shared machine on retry) — not evidence against the cost-model shape
@@ -82,14 +98,21 @@ sentence, an unexplained discrepancy not worth trusting).
 
 | level | size (MiB) | perplexity | prefill@1024 (ms) | decode TBT (ms) |
 |---|---|---|---|---|
-| fp16 | 1207.8 | 11.93 | 703.9 | 17.8 |
-| q8_0 | 644.4 | 11.89 | 683.0 | 12.3 |
-| q4_k_m | 468.6 | 12.59 | 658.4 | 10.1 |
+| fp16 | 1207.8 | 11.93 | 401.8 (was 703.9) | 14.1 (was 17.8) |
+| q8_0 | 644.4 | 11.89 | 418.2 (was 683.0) | 13.8 (was 12.3; noisy, std 7.1) |
+| q4_k_m | 468.6 | 12.59 | 454.3 (was 658.4) | 9.2 (was 10.1) |
 
-Real mechanism, not a fabricated one: prefill (compute-bound) speeds up
-only modestly (~6.5%, fp16→q4_k_m), while decode (memory-bandwidth-bound)
-speeds up substantially (~43%) because lower-precision weights move less
-data per token — this is why the original study's claim of a uniform ~2x
+The original prefill column was timed on the `logits_all=True` instance
+used for perplexity, so each timed `eval()` also copied n×vocab logits
+into Python. That inflated it by ~45–75% and made fp16 *look* slowest.
+Corrected:
+
+Real mechanism, not a fabricated one: prefill (compute-bound) does **not**
+speed up with quantization on this backend. q4_k_m is ~13% *slower* than
+fp16 at N=1024 (and 11% at N=256), consistent with compute-bound prompt
+processing paying a dequantization cost. Decode (memory-bandwidth-bound)
+speeds up substantially (~35%, fp16→q4_k_m) because lower-precision
+weights move less data per token — this is why the original study's claim of a uniform ~2x
 GEMM speedup from quantization was never physically plausible on this
 hardware. Quality cost, measured rather than asserted: perplexity rises
 only ~5.5% relative (11.93→12.59) on the fixed reference passage from fp16

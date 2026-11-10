@@ -9,73 +9,74 @@
     ],
     "trials": 8,
     "reference_passage": "Pride and Prejudice, opening paragraph (public domain)",
-    "perplexity_method": "manual log_softmax over raw per-position logits (logits_all=True); NOT the high-level create_completion(echo=True, logprobs=1) API, which returned an unexplained 569 'tokens' for a 23-token sentence during development and was rejected as untrustworthy."
+    "perplexity_method": "manual log_softmax over raw per-position logits (logits_all=True); NOT the high-level create_completion(echo=True, logprobs=1) API, which returned an unexplained 569 'tokens' for a 23-token sentence during development and was rejected as untrustworthy.",
+    "timing_method": "prefill/decode timed on a SEPARATE logits_all=False instance (perplexity's logits_all=True would add an n x vocab logits copy to every timed eval), with an explicit GPU sync (llama_get_logits_ith) after every timed eval() -- see core/SYNC_AUDIT_FINDINGS.md."
   },
   "levels": {
     "fp16": {
       "file_size_mb": 1207.8,
-      "load_ms": 265.9,
+      "load_ms": 136.2,
       "perplexity": 11.9326,
       "prefill_by_n_tokens": {
         "256": {
-          "mean_ms": 143.64,
-          "std_ms": 4.75,
-          "min_ms": 135.41
+          "mean_ms": 92.74,
+          "std_ms": 0.18,
+          "min_ms": 92.53
         },
         "1024": {
-          "mean_ms": 703.93,
-          "std_ms": 94.55,
-          "min_ms": 603.46
+          "mean_ms": 401.83,
+          "std_ms": 1.41,
+          "min_ms": 400.67
         }
       },
       "decode_tbt": {
-        "mean_ms": 17.77,
-        "std_ms": 6.76,
-        "min_ms": 14.78
+        "mean_ms": 14.1,
+        "std_ms": 0.82,
+        "min_ms": 13.61
       }
     },
     "q8_0": {
       "file_size_mb": 644.4,
-      "load_ms": 137.6,
+      "load_ms": 137.4,
       "perplexity": 11.8908,
       "prefill_by_n_tokens": {
         "256": {
-          "mean_ms": 147.65,
-          "std_ms": 4.79,
-          "min_ms": 142.47
+          "mean_ms": 95.64,
+          "std_ms": 0.19,
+          "min_ms": 95.48
         },
         "1024": {
-          "mean_ms": 683.0,
-          "std_ms": 64.89,
-          "min_ms": 634.9
+          "mean_ms": 418.2,
+          "std_ms": 2.87,
+          "min_ms": 414.4
         }
       },
       "decode_tbt": {
-        "mean_ms": 12.34,
-        "std_ms": 2.43,
-        "min_ms": 10.41
+        "mean_ms": 13.82,
+        "std_ms": 7.09,
+        "min_ms": 9.62
       }
     },
     "q4_k_m": {
       "file_size_mb": 468.6,
-      "load_ms": 142.8,
+      "load_ms": 139.7,
       "perplexity": 12.5879,
       "prefill_by_n_tokens": {
         "256": {
-          "mean_ms": 156.89,
-          "std_ms": 6.2,
-          "min_ms": 150.47
+          "mean_ms": 102.77,
+          "std_ms": 0.94,
+          "min_ms": 102.13
         },
         "1024": {
-          "mean_ms": 658.36,
-          "std_ms": 26.86,
-          "min_ms": 641.67
+          "mean_ms": 454.26,
+          "std_ms": 13.05,
+          "min_ms": 442.2
         }
       },
       "decode_tbt": {
-        "mean_ms": 10.07,
-        "std_ms": 0.95,
-        "min_ms": 9.24
+        "mean_ms": 9.23,
+        "std_ms": 0.4,
+        "min_ms": 8.93
       }
     }
   }

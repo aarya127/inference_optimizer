@@ -225,8 +225,8 @@ scope/venv_phase0/bin/python integrated_service.py --api
   machine), documented rather than discarded
 - [baseline/TIER2_LLAMACPP_FINDINGS.md](baseline/TIER2_LLAMACPP_FINDINGS.md)
   — a second model (Qwen2.5-0.5B) on a second backend (llama.cpp/Metal)
-  validates the same quadratic cost-model form with LOOCV MAPE 5.72% (vs
-  SmolVLM/MLX's 20.7%), supporting that the 20.7% gap was a data-density
+  validates the same quadratic cost-model form with LOOCV MAPE 1.68%
+  (5.72% before the sync-audit re-run; vs SmolVLM/MLX's 20.7%), supporting that the 20.7% gap was a data-density
   issue, not a modeling one; also a real, measured fp16/Q8_0/Q4_K_M
   quantization tradeoff (size, speed, perplexity) replacing this study's
   earlier fabricated quantization claims
@@ -253,9 +253,9 @@ scope/venv_phase0/bin/python integrated_service.py --api
 - [core/TIER6_REAL_CONCURRENCY_FINDINGS.md](core/TIER6_REAL_CONCURRENCY_FINDINGS.md)
   — checks `ConcurrencyThroughputTechnique`'s MODELED concurrency
   prediction against real decode throughput two ways: independent threads
-  (~2.3x worse than predicted at B=4) and real native multi-sequence
-  batching via llama.cpp's low-level `llama_batch` API (1.72x worse at
-  B=4, 3.26x at B=8) -- real batching helps over the naive proxy but the
+  (~2.8x worse than predicted at B=4) and real native multi-sequence
+  batching via llama.cpp's low-level `llama_batch` API (2.28x worse at
+  B=4, 4.28x at B=8; ratios corrected by the sync audit) -- real batching helps over the naive proxy but the
   model still substantially underestimates per-sequence compute cost; not
   silently recalibrated to these results, just honestly flagged
 - [core/TIER7_PREFIX_CACHE_FINDINGS.md](core/TIER7_PREFIX_CACHE_FINDINGS.md)
@@ -265,8 +265,17 @@ scope/venv_phase0/bin/python integrated_service.py --api
   can return before its GPU work finishes, silently corrupting timing that
   interleaves different shapes -- the same class of bug, independently
   rediscovered, that originally motivated this project's MLX honesty
-  rewrite. Whether it affects this repo's other llama.cpp timing scripts
-  is flagged as an open, unverified risk, not assumed either way.
+  rewrite.
+- [core/SYNC_AUDIT_FINDINGS.md](core/SYNC_AUDIT_FINDINGS.md) — the audit of
+  every other llama.cpp timing script for that bug. Prefill: not
+  materially affected. Decode: inflated up to ~85% (the first decode step
+  absorbed the preceding prefill), which created a fake per-context
+  decode slope in both llama.cpp profiles and skewed Tier 6's modeled
+  baseline. Also found a separate quantization-timing bug (a ~620 MB
+  logits copy inside every timed prefill) whose fix reverses the "quant
+  speeds up prefill" result. Recalibration then exposed a real cost-model
+  blind spot: prefill has n_batch chunk steps the calibration grid never
+  samples, which is why the Qwen closed loop now misses its SLA 1 time in 3.
 - [docs/DESIGN.md](docs/DESIGN.md) — historical design document; some original
   targets are retained as superseded context
 - [docs/INSTALL.md](docs/INSTALL.md) — historical install guide for the

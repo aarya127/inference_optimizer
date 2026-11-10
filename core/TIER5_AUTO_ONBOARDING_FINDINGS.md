@@ -43,6 +43,18 @@ Calibration result (10 points, N in [32, 2048]):
 | MAPE (in-sample) | 3.01% | 2.30% | 1.61% |
 | MAPE (LOOCV) | 20.7% | 5.72% | **2.76%** |
 
+> **Recalibrated after the sync-bug audit ([SYNC_AUDIT_FINDINGS.md](SYNC_AUDIT_FINDINGS.md)).**
+> `calibrate.py`'s decode sweep let the untimed prefill leak into the first
+> timed decode step, so the SmolLM2 decode fit came out at 7.93 +
+> 0.0139·ctx ms, ~3x too steep. The re-run gives a flat 8.59 ms (raw slope
+> −0.005, clamped). The prefill side was not materially affected. The
+> re-run's fit is LOOCV 2.98% mean / 6.64% max (R² 0.9986), and Qwen/llama.cpp's
+> re-measured LOOCV is 1.68% (was 5.72%). The table above is kept as the
+> original run's record. The closed-loop result below was **not**
+> reproduced with the recalibrated profile: N=1088 passed its 500ms SLA
+> on 3/3 runs, but by as little as 0.2ms. See SYNC_AUDIT_FINDINGS.md §6
+> for why (n_batch chunk steps).
+
 The third independently-calibrated model has the *best* LOOCV of the
 three, reinforcing Tier 1/2's conclusion: data density and measurement
 discipline (10 clean points vs. 4) is what drives validation quality here,
@@ -81,7 +93,7 @@ is backend-independent as it should be):
 
 | | Qwen2.5-0.5B / llama.cpp | Qwen2.5-0.5B / MLX |
 |---|---|---|
-| LOOCV MAPE | 5.72% | **2.05%** |
+| LOOCV MAPE | 5.72% (1.68% after the sync-audit re-run) | **2.05%** |
 | R² (in-sample) | 0.9996 | 0.9995 |
 
 Same model, two backends, two independently automated calibration runs —

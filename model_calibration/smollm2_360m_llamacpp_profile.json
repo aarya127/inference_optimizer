@@ -7,6 +7,7 @@
   "supports_vision": false,
   "architecture": {
     "source_config_url": "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/raw/main/config.json",
+    "nested_under_text_config": false,
     "hidden_size": 960,
     "num_layers": 32,
     "num_attention_heads": 15,
@@ -19,13 +20,13 @@
   "kv_bytes_per_token": 40960,
   "bandwidth_gbps": 100.0,
   "prefill": {
-    "gamma": 5.816081474628719e-05,
-    "beta": 0.35803397176376084,
-    "alpha": 5.075623229622741,
-    "r2": 0.9999201241467885,
-    "insample_mape_pct": 1.455187929234438,
-    "loocv_mape_pct": 2.695863510673317,
-    "loocv_max_ape_pct": 10.445001930597002,
+    "gamma": 7.614872957630976e-05,
+    "beta": 0.34105611023523624,
+    "alpha": 5.480067630400576,
+    "r2": 0.9985885819314823,
+    "insample_mape_pct": 2.2561155790413756,
+    "loocv_mape_pct": 2.9750393115993066,
+    "loocv_max_ape_pct": 6.637982963019638,
     "domain_n": [
       32.0,
       2048.0
@@ -34,65 +35,65 @@
     "points": [
       {
         "n_tokens": 32,
-        "mean_ms": 16.739005140960217,
-        "std_ms": 0.11021546264055022
+        "mean_ms": 16.765817493200302,
+        "std_ms": 0.18185845982262622
       },
       {
         "n_tokens": 64,
-        "mean_ms": 27.895620115101337,
-        "std_ms": 0.382163700200962
+        "mean_ms": 27.465468749403954,
+        "std_ms": 0.16330486785049247
       },
       {
         "n_tokens": 128,
-        "mean_ms": 50.635411478579044,
-        "std_ms": 0.8271646801771573
+        "mean_ms": 50.40643726289272,
+        "std_ms": 0.3353646624925054
       },
       {
         "n_tokens": 256,
-        "mean_ms": 95.55736450850964,
-        "std_ms": 0.5433004324752336
+        "mean_ms": 95.4175574183464,
+        "std_ms": 0.6007944981572587
       },
       {
         "n_tokens": 384,
-        "mean_ms": 155.9801353737712,
-        "std_ms": 0.9645982792771112
+        "mean_ms": 157.83026549220085,
+        "std_ms": 2.9207445861655255
       },
       {
         "n_tokens": 512,
-        "mean_ms": 204.28925511986017,
-        "std_ms": 0.8096693209304369
+        "mean_ms": 208.10204687714577,
+        "std_ms": 3.926236297000971
       },
       {
         "n_tokens": 768,
-        "mean_ms": 314.93817687034607,
-        "std_ms": 1.205358210098358
+        "mean_ms": 320.0245676636696,
+        "std_ms": 5.982179098357423
       },
       {
         "n_tokens": 1024,
-        "mean_ms": 436.97027100622654,
-        "std_ms": 1.1657449537924394
+        "mean_ms": 435.5859530568123,
+        "std_ms": 0.7087165538874555
       },
       {
         "n_tokens": 1536,
-        "mean_ms": 691.9412708580494,
-        "std_ms": 1.4252926286291896
+        "mean_ms": 697.444604113698,
+        "std_ms": 4.812335897836751
       },
       {
         "n_tokens": 2048,
-        "mean_ms": 980.1270207613707,
-        "std_ms": 1.704732737497604
+        "mean_ms": 992.303296983242,
+        "std_ms": 11.744192041040696
       }
     ]
   },
   "decode": {
-    "overhead_ms": 7.934540803624819,
-    "per_ctx_token_ms": 0.013916204518094541,
-    "raw_fit_overhead_ms": 7.934540803624819,
-    "raw_fit_per_ctx_token_ms": 0.013916204518094541,
+    "overhead_ms": 8.592460698634387,
+    "per_ctx_token_ms": 0.0,
+    "raw_fit_overhead_ms": 9.504057937274832,
+    "raw_fit_per_ctx_token_ms": -0.005275446982872951,
     "domain_ctx": [
       32.0,
       384.0
     ],
-    "clamped_negative_slope": false
+    "clamped_negative_slope": true
   }
 }

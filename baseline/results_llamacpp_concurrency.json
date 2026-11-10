@@ -1,7 +1,7 @@
 {
   "meta": {
     "model_file": "SmolLM2-360M-Instruct-Q4_K_M.gguf",
-    "method": "B independent llama.cpp contexts (own weights copy, own KV cache each), B Python threads decoding concurrently with no server-side batching -- NOT llama.cpp's native multi-sequence batched llama_decode. Effective TBT/sequence = wall time for B threads x n_steps steps / n_steps."
+    "method": "B independent llama.cpp contexts (own weights copy, own KV cache each), B Python threads decoding concurrently with no server-side batching -- NOT llama.cpp's native multi-sequence batched llama_decode. Effective TBT/sequence = wall time for B threads x n_steps steps / n_steps. Prefill synced and an untimed decode warm-up run before the first timed trial (see core/SYNC_AUDIT_FINDINGS.md)."
   },
   "runs": [
     {
@@ -9,14 +9,14 @@
       "ctx_tokens": 256,
       "n_steps": 30,
       "effective_tbt_ms": {
-        "mean": 16.544996666908265,
-        "std": 20.791867030244372,
+        "mean": 7.6905897212028504,
+        "std": 1.055296165863015,
         "trials_ms": [
-          53.73782363335292,
-          7.074422234296799,
-          7.153111100196838,
-          7.373123600085576,
-          7.386502766609192
+          6.999009736378988,
+          6.960884702205658,
+          7.494816668828329,
+          7.474891666571299,
+          9.523345832029978
         ]
       }
     },
@@ -25,14 +25,14 @@
       "ctx_tokens": 256,
       "n_steps": 30,
       "effective_tbt_ms": {
-        "mean": 13.739401946862538,
-        "std": 2.650348871150966,
+        "mean": 13.197521107196808,
+        "std": 1.291629199896549,
         "trials_ms": [
-          17.670918069283168,
-          11.769938900073369,
-          15.173008334636688,
-          11.355527766545613,
-          12.727616663773855
+          10.931698600451151,
+          13.41739859978358,
+          14.023529167970022,
+          13.627887503306072,
+          13.987091664473216
         ]
       }
     },
@@ -41,14 +41,14 @@
       "ctx_tokens": 256,
       "n_steps": 30,
       "effective_tbt_ms": {
-        "mean": 27.174163612922033,
-        "std": 4.660430666668426,
+        "mean": 24.83867083231608,
+        "std": 0.3174854471138095,
         "trials_ms": [
-          35.20305833220482,
-          23.127390267451606,
-          26.069480566183724,
-          26.318016666173936,
-          25.152872232596078
+          24.498736095428466,
+          24.533237500985464,
+          25.19792223374049,
+          24.87138890028,
+          25.092069431145987
         ]
       }
     }

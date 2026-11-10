@@ -128,7 +128,10 @@ tightened further after a mean-based margin was tried and found
 insufficient (see TIER5 below). Re-verified across all four profiles: every
 one that returns a token budget now meets its SLA with real headroom, not
 a near-miss (e.g. Qwen/llama.cpp: 356.7ms measured vs a 500ms SLA, 31.7%
-margin). SmolVLM/MLX is the interesting case — its margin (59.9%) is now
+margin). **No longer true after the sync-audit recalibration:** Qwen's
+margin shrank to 3.4% and missed the SLA on 1 of 3 runs, because of an
+n_batch chunk-step blind spot in the cost model (see
+`SYNC_AUDIT_FINDINGS.md` §6 and `TIER4_CLOSED_LOOP_FINDINGS.md`). SmolVLM/MLX is the interesting case — its margin (59.9%) is now
 large enough that the technique correctly reports **no feasible token
 count** for a 500ms SLA, matching this project's own long-standing finding
 that the SLA is infeasible on this hardware. Full detail in
@@ -161,7 +164,7 @@ models, reusing `core/calibrate.py`'s fit/architecture functions unchanged
 (they were already backend-agnostic). Proven by calibrating the *same*
 Qwen2.5-0.5B-Instruct model already profiled on llama.cpp — a genuine
 same-model, cross-backend comparison (LOOCV 2.05% on MLX vs 5.72% on
-llama.cpp; identical `kv_bytes_per_token`, as expected for the same
+llama.cpp, 1.68% after the sync-audit re-run; identical `kv_bytes_per_token`, as expected for the same
 architecture). `MLXLMExecutor` is the generic text-only counterpart to the
 vision-specific `MLXExecutor`, resolving everything from `profile.model_id`.
 
@@ -194,8 +197,8 @@ from day one. Checked two ways, both showing it is **substantially too
 optimistic**:
 
 1. `baseline/measure_llamacpp_concurrency.py` — B independent llama.cpp
-   contexts, Python threads (a proxy, not real batching): ~2.3x worse than
-   predicted at B=4.
+   contexts, Python threads (a proxy, not real batching): ~2.8x worse than
+   predicted at B=4 (2.3x before the sync-audit correction).
 2. `baseline/measure_llamacpp_native_batching.py` — the real scenario the
    technique is meant to predict: one context, one shared KV cache, real
    native multi-sequence batching via llama.cpp's low-level `llama_batch`
@@ -204,9 +207,11 @@ optimistic**:
    differently-prompted sequences completed correctly and independently
    across multiple decode steps before trusting any timing). Real batching
    *does* help — consistently faster than the independent-threads proxy —
-   but is still **1.72x worse at B=4 and 3.26x worse at B=8** than the
-   model's near-flat prediction (11.5ms → 11.8ms from B=1 to B=4, since it
-   only models KV-bandwidth contention). A linear fit to the real data
+   but is still **2.28x worse at B=4 and 4.28x worse at B=8** than the
+   model's near-flat prediction (8.6ms → 8.9ms from B=1 to B=4, since it
+   only models KV-bandwidth contention). These ratios were 1.72x / 3.26x
+   before `SYNC_AUDIT_FINDINGS.md` corrected the batch=1 decode fit the
+   model starts from. A linear fit to the real data
    implies a ~4.6ms per-extra-sequence marginal cost — ~44x the model's
    assumed 0.105ms — because decode compute, not just KV-bandwidth, scales
    with batch size at these sizes, something the model ignores entirely.
@@ -232,10 +237,18 @@ in one measurement. Fixed here by reading a logit (a real synchronization
 point) after every timed `eval()`. This is the same class of bug,
 independently rediscovered, that originally motivated this project's
 entire honesty rewrite on the MLX side (`mx.eval()` called with no
-arguments, synchronizing nothing). **Whether this affects this repo's
-other llama.cpp timing scripts is an open, unresolved question** — not
-confirmed broken, not confirmed safe. Full writeup, including that open
-risk, in `TIER7_PREFIX_CACHE_FINDINGS.md`.
+arguments, synchronizing nothing). Full writeup in
+`TIER7_PREFIX_CACHE_FINDINGS.md`.
+
+**Audit of every other llama.cpp timing script: `SYNC_AUDIT_FINDINGS.md`.**
+Prefill numbers were not materially affected (same-shape loops
+self-corrected, by accident of call order). Decode numbers were: the
+first timed decode step absorbed the preceding prefill, inflating mean
+TBT up to ~85% and creating a fake per-context decode slope in both
+llama.cpp profiles (now corrected and re-measured). The audit also fixed
+a separate quantization-timing bug, and it found that the prefill cost
+model is blind to n_batch chunk steps, which now makes Qwen's thin margin
+miss its SLA on some closed-loop runs. That one is still open.
 
 ## What this is not (yet)
 

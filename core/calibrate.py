@@ -125,22 +125,41 @@ def _build_tokens(llm, n_tokens: int) -> list[int]:
     return toks[:n_tokens]
 
 
+def _sync(llm) -> None:
+    """Block until the most recent eval()'s GPU work has finished.
+
+    llama_decode() returns before its Metal work completes, and
+    llama-cpp-python 0.3.x's eval() does not read logits (logits_all=False),
+    so nothing inside eval() waits; llama_get_logits_ith() calls
+    llama_synchronize() first. Without this, calibrate_decode()'s first
+    timed step absorbed the whole untimed prefill before it, inflating mean
+    TBT in proportion to ctx -- the SmolLM2 profile's decode slope came out
+    ~3x too steep (0.0139 vs ~0.0044 ms/ctx-token). See
+    core/SYNC_AUDIT_FINDINGS.md."""
+    llm._ctx.get_logits_ith(-1)
+
+
+def _eval_sync(llm, tokens: list[int]) -> None:
+    llm.eval(tokens)
+    _sync(llm)
+
+
 def calibrate_prefill(llm, token_counts: list[int], trials: int) -> list[dict]:
     points = []
     warm = _build_tokens(llm, token_counts[0])
     llm.reset()
-    llm.eval(warm)  # global warm-up, discarded
+    _eval_sync(llm, warm)  # global warm-up, discarded
 
     for n_tok in token_counts:
         tokens = _build_tokens(llm, n_tok)
         llm.reset()
-        llm.eval(tokens)  # per-shape warm-up, discarded
+        _eval_sync(llm, tokens)  # per-shape warm-up, discarded
 
         times = []
         for _ in range(trials):
             llm.reset()
             t0 = _now_ms()
-            llm.eval(tokens)
+            _eval_sync(llm, tokens)
             times.append(_now_ms() - t0)
 
         mean_t = statistics.mean(times)
@@ -155,12 +174,12 @@ def calibrate_decode(llm, ctx_tokens_list: list[int], n_decode: int = 32) -> lis
     for ctx in ctx_tokens_list:
         tokens = _build_tokens(llm, ctx)
         llm.reset()
-        llm.eval(tokens)
+        _eval_sync(llm, tokens)  # untimed prefill; synced so it can't leak into step 1
         tbt = []
         for _ in range(n_decode):
             t0 = _now_ms()
             tok = llm.sample()
-            llm.eval([tok])
+            _eval_sync(llm, [tok])
             tbt.append(_now_ms() - t0)
         results.append({"ctx_tokens": ctx, "mean_ms": statistics.mean(tbt)})
     return results

@@ -15,12 +15,15 @@ the SLA breaks", assuming memory is not the binding constraint.
 
 CHECKED AGAINST REALITY TWICE (core/TIER6_REAL_CONCURRENCY_FINDINGS.md) AND
 FOUND SUBSTANTIALLY TOO OPTIMISTIC BOTH TIMES: an independent-contexts
-proxy measurement (SmolLM2-360M, ctx=256) showed ~2.3x worse TBT than this
+proxy measurement (SmolLM2-360M, ctx=256) showed ~2.8x worse TBT than this
 formula predicts at B=4. The real scenario this technique is meant to
 predict -- one context, one shared KV cache, real native multi-sequence
 batching via llama.cpp's low-level llama_batch API -- was then measured
 directly and was ALSO substantially worse than predicted, just less so:
-1.72x at B=4, 3.26x at B=8, and growing with B. A linear fit to the real
+2.28x at B=4, 4.28x at B=8, and growing with B. (Ratios corrected after
+core/SYNC_AUDIT_FINDINGS.md: the batch=1 decode fit this formula starts
+from had been inflated by a GPU-sync bug; originally reported as
+2.3x / 1.72x / 3.26x.) A linear fit to the real
 native-batched data implies a per-extra-sequence marginal cost around
 4.6ms -- roughly 44x this formula's assumed 0.105ms/sequence
 KV-bandwidth-only cost -- because decode at these batch sizes is not

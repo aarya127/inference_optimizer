@@ -81,34 +81,29 @@ dispatch (MLX's lazy evaluation graph, here Metal command buffers behind
 real synchronization point and never trust a timer around a call that
 might not have actually finished.
 
-## Open risk: this project's other llama.cpp timing scripts are NOT verified safe
+## Resolved: audit of this project's other llama.cpp timing scripts
 
-This bug was *confirmed* in the specific scenario of interleaving two
-different shapes in one loop. It was *not* shown to be absent from this
-repo's other llama.cpp measurement scripts — `baseline/measure_llamacpp.py`,
+This section originally flagged `baseline/measure_llamacpp.py`,
 `core/calibrate.py`, `baseline/measure_quantization_tradeoff.py`, and
-`baseline/measure_llamacpp_concurrency.py` all use the same
-unsynchronized `t0 = now(); llm.eval(tokens); dt = now() - t0` pattern,
-just always with the *same* shape repeated in a loop rather than
-interleaved shapes. Their results have been internally consistent and
-physically plausible throughout this project (clean quadratic fits,
-R²>0.999, monotonic scaling, bandwidth calculations that check out) — but
-"the numbers look plausible" is not the same as "verified correct", and
-that was exactly also true of several numbers this project's own
-REVIEW_FINDINGS.md later found to be fabricated. Two things are true at
-once: (1) there is no positive evidence any of those other scripts'
-reported numbers are wrong, and (2) there has been no systematic check
-that they are right, now that a mechanism for silent, plausible-looking
-corruption is known to exist in this exact API. `baseline/measure_llamacpp_native_batching.py`
-is the one exception known to be safe by construction — its decode loop
-must read real logits via `get_logits_ith` to pick each next token, which
-is itself the needed synchronization point.
+`baseline/measure_llamacpp_concurrency.py` as an open, unverified risk.
+The audit is done; full detail in
+[SYNC_AUDIT_FINDINGS.md](SYNC_AUDIT_FINDINGS.md). In brief:
 
-**This is flagged here as open, unresolved risk, not swept under either
-direction** — not "probably fine because the numbers look clean" and not
-"probably wrong, discard everything." A proper audit (add `_sync()` after
-every timed `eval()` in those four scripts and re-run, diff against the
-existing numbers) is real follow-up work, not done here.
+- **Prefill timing was not materially affected.** Same-shape loops
+  self-correct on the mean (each call waits for the previous one's tail),
+  but only by accident of call order. All call sites now sync explicitly.
+- **Decode timing was affected.** The first decode step absorbed the whole
+  preceding prefill, inflating mean TBT in proportion to context length
+  (up to ~85%). That produced a fake per-context-token decode slope in both
+  llama.cpp profiles (Qwen: 0.00446 → 0.00167 ms/token; SmolLM2: 0.0139 →
+  flat), and through that, Tier 6's MODELED concurrency baseline.
+- **The quantization script had a different bug:** it timed prefill on its
+  `logits_all=True` perplexity instance, so every timed `eval()` included a
+  ~620 MB logits copy. Fixed, and the corrected numbers reverse the
+  published "quantization speeds up prefill slightly" finding.
+- **Recalibration exposed a real cost-model blind spot** (n_batch chunk
+  steps the calibration grid never samples) that the old, noisier Qwen
+  margin had been covering. See SYNC_AUDIT_FINDINGS.md §6.
 
 ## What this doesn't do
 

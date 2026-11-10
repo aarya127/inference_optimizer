@@ -24,7 +24,10 @@ LOOCV) missed its SLA on two separate real runs with 2.4-2.6% real error
 (TIER4_CLOSED_LOOP_FINDINGS.md's second follow-up). The max is itself
 still just a resampling estimate from a handful of calibration points, not
 a hard worst case -- it helped close that specific gap (Qwen/llama.cpp's
-max LOOCV AE is 31.7%, vs a 5.7% mean) and brought SmolVLM/MLX's margin
+max LOOCV AE was 31.7%, vs a 5.7% mean; after the sync-audit recalibration
+it is 3.4%, which is NOT enough -- LOOCV can't see the n_batch chunk
+steps the calibration grid never samples, see
+core/SYNC_AUDIT_FINDINGS.md section 6) and brought SmolVLM/MLX's margin
 far closer to its real 41-108% closed-loop error (max LOOCV AE 59.9%, vs a
 20.7% mean) -- but it is still not a guarantee, particularly for SmolVLM,
 whose real-world unreliability has repeatedly exceeded even generous

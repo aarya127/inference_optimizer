@@ -35,6 +35,17 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def _sync(llm) -> None:
+    """Block until the most recent eval()'s GPU work has finished.
+    llama_decode() returns before its Metal work completes;
+    llama_get_logits_ith() calls llama_synchronize() first. The unsynced
+    version of the loop below happened to give the right mean (each call
+    waited on the previous call's tail, and the warm-up's tail landed in
+    trial 1), but only by accident of call order. See
+    core/SYNC_AUDIT_FINDINGS.md."""
+    llm._ctx.get_logits_ith(-1)
+
+
 def resolve_gguf_filename(profile: ModelHardwareProfile, quant_level: Optional[str]) -> str:
     """The single place that turns (profile, quant_level) into a filename."""
     if quant_level is not None:
@@ -108,12 +119,14 @@ class LlamaCppExecutor(Executor):
         # Discarded warm-up (shape-dependent kernel dispatch).
         llm.reset()
         llm.eval(tokens)
+        _sync(llm)
 
         times = []
         for _ in range(trials):
             llm.reset()
             t0 = _now_ms()
             llm.eval(tokens)
+            _sync(llm)
             times.append(_now_ms() - t0)
         measured = sum(times) / len(times)
 

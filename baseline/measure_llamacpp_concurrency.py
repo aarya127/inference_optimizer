@@ -61,11 +61,23 @@ def _build_tokens(llm, n_tokens: int) -> list[int]:
     return toks[:n_tokens]
 
 
+def _sync(llm) -> None:
+    """llama_get_logits_ith() calls llama_synchronize(): blocks until this
+    context's in-flight GPU work is done. See core/SYNC_AUDIT_FINDINGS.md."""
+    llm._ctx.get_logits_ith(-1)
+
+
+WARMUP_STEPS = 5
+
+
 def measure_concurrency(concurrency: int, ctx_tokens: int, n_steps: int, n_trials: int) -> dict:
     from llama_cpp import Llama
 
     model_path = MODEL_DIR / MODEL_FILE
-    n_ctx = ctx_tokens + n_steps + 16
+    # The KV cache is NOT reset between trials (each trial keeps decoding
+    # where the last stopped), so size for prefill + warm-up + all trials
+    # explicitly rather than relying on llama.cpp padding n_ctx upward.
+    n_ctx = ctx_tokens + WARMUP_STEPS + n_steps * n_trials + 16
 
     print(f"\n[B={concurrency}] loading {concurrency} independent context(s)...")
     llms = [Llama(model_path=str(model_path), n_gpu_layers=-1, n_ctx=n_ctx, verbose=False)
@@ -75,12 +87,24 @@ def measure_concurrency(concurrency: int, ctx_tokens: int, n_steps: int, n_trial
     for llm in llms:
         llm.reset()
         llm.eval(tokens)  # untimed prefill to the common context length
+        _sync(llm)  # so no prefill work is still in flight when trial 1's timer starts
 
     def worker(llm, steps: int):
         tok = llm.sample()
         for _ in range(steps):
             llm.eval([tok])
             tok = llm.sample()
+
+    # Untimed decode warm-up at this B: the prefill above exercises the
+    # prompt-processing path, not the single-token decode path the timed
+    # loop uses. Without this, trial 1 measured 50-54ms vs a steady 7.2ms
+    # at B=1 (and was inflated ~1.5x at B=2/B=4 too) -- see
+    # core/SYNC_AUDIT_FINDINGS.md.
+    warm = [threading.Thread(target=worker, args=(llm, WARMUP_STEPS)) for llm in llms]
+    for t in warm:
+        t.start()
+    for t in warm:
+        t.join()
 
     trial_tbt_ms = []
     for trial in range(n_trials):
@@ -131,7 +155,9 @@ def main():
                       "KV cache each), B Python threads decoding concurrently "
                       "with no server-side batching -- NOT llama.cpp's native "
                       "multi-sequence batched llama_decode. Effective TBT/"
-                      "sequence = wall time for B threads x n_steps steps / n_steps.",
+                      "sequence = wall time for B threads x n_steps steps / n_steps. "
+                      "Prefill synced and an untimed decode warm-up run before "
+                      "the first timed trial (see core/SYNC_AUDIT_FINDINGS.md).",
         },
         "runs": [],
     }

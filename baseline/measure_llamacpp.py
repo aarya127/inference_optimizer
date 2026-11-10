@@ -4,8 +4,8 @@ Purpose (Tier 2 of the roadmap): everything measured so far in this repo
 uses one model (SmolVLM-Instruct-4bit) on one backend (MLX). This script
 applies the SAME honest measurement discipline established in
 baseline/measure_v2.py -- real inference calls, real synchronization
-(llama.cpp calls are synchronous, so no mx.eval-style lazy-eval trap here),
-warm-up before timing, N independent trials with mean/std/min reported, no
+(an explicit _sync() after every eval() -- llama_decode() is NOT synchronous
+on Metal, see _sync() and core/SYNC_AUDIT_FINDINGS.md), warm-up before timing, N independent trials with mean/std/min reported, no
 derived residuals, no fabricated percentiles -- to a DIFFERENT model on a
 DIFFERENT inference engine (llama.cpp via llama-cpp-python, Metal GPU
 offload), to see whether the quadratic T_prefill(N) cost-model form and the
@@ -76,24 +76,44 @@ def build_token_sequence(llm, n_tokens: int) -> list[int]:
     return toks[:n_tokens]
 
 
+def _sync(llm) -> None:
+    """Block until the most recent eval()'s GPU work has finished.
+
+    llama_decode() returns before its Metal work completes (measured: for a
+    single n_batch chunk, eval() returns in ~1ms while the real work takes
+    17-204ms), and llama-cpp-python 0.3.x's eval() never reads logits when
+    logits_all=False, so nothing inside eval() waits. llama_get_logits_ith()
+    calls llama_synchronize() first, making it a real sync point. Without
+    this, decode TBT's first step silently absorbed the whole preceding
+    prefill (an earlier version of this script reported decode means up to
+    ~65% too high, growing with context -- a fake per-context-token decode
+    slope). See core/SYNC_AUDIT_FINDINGS.md."""
+    llm._ctx.get_logits_ith(-1)
+
+
 def measure_prefill(llm, tokens: list[int]) -> float:
     """Real prefill: llm.eval() processes all tokens through the model and
-    updates the KV cache -- llama.cpp calls are synchronous, so the wall
-    time IS the compute time (no lazy-eval trap to guard against here)."""
+    updates the KV cache, timed through an explicit _sync()."""
     llm.reset()
+    _sync(llm)  # nothing from a prior call may still be in flight
     t0 = _now_ms()
     llm.eval(tokens)
+    _sync(llm)
     return _now_ms() - t0
 
 
 def measure_decode(llm, n_decode_tokens: int) -> list[float]:
     """Per-token decode latency via manual sample+eval loop, matching the
-    stepwise cached-decode methodology in baseline/measure_v2.py."""
+    stepwise cached-decode methodology in baseline/measure_v2.py. Each step
+    is synced, so step k's time is step k's work (not step k-1's tail, and
+    the first step does not absorb the preceding prefill)."""
+    _sync(llm)
     tbt = []
     for _ in range(n_decode_tokens):
         t0 = _now_ms()
         tok = llm.sample()
         llm.eval([tok])
+        _sync(llm)
         tbt.append(_now_ms() - t0)
     return tbt
 
@@ -138,8 +158,10 @@ def main():
             "decode_tokens": args.decode_tokens,
             "n_ctx": args.n_ctx,
             "load_ms": round(load_ms, 1),
-            "method": "llm.eval(tokens) for prefill (synchronous, real KV-cache "
-                      "update); llm.reset() between trials to clear cache "
+            "method": "llm.eval(tokens) for prefill (real KV-cache update), "
+                      "with an explicit GPU sync (llama_get_logits_ith) before "
+                      "and after every timed eval() -- llama_decode() is async "
+                      "on Metal; llm.reset() between trials to clear cache "
                       "without reloading weights; 1 discarded warm-up trial "
                       "per token count; N timed trials, mean/std/min reported.",
         },

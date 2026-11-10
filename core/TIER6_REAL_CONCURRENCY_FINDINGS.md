@@ -12,6 +12,16 @@ to complete 30 steps, divided by 30 — i.e. how long one of the B streams
 actually waits between its own tokens, the exact quantity the technique
 predicts.
 
+> **Updated after the sync-bug audit ([SYNC_AUDIT_FINDINGS.md](SYNC_AUDIT_FINDINGS.md)).**
+> The MODELED column used SmolLM2's decode fit, which a GPU-sync bug in
+> `core/calibrate.py` had inflated (7.93 + 0.0139·ctx → corrected 8.59
+> flat). The independent-threads run is also re-measured with a decode
+> warm-up that removes its trial-1 artifact. The tables below show the
+> corrected numbers, with originals in parentheses. Net effect: the
+> model's B=1 over-prediction mostly disappears, and its under-pricing of
+> extra sequences gets **worse**, so this doc's conclusion is
+> strengthened.
+
 **This is not llama.cpp's native multi-sequence batching** (one shared KV
 cache, one `llama_decode` call per step across all sequences via the
 low-level `llama_batch` API) — that would need direct ctypes-level work
@@ -24,11 +34,11 @@ than to a continuous-batching server.
 
 | B | MODELED TBT/seq (ms) | MEASURED TBT/seq (ms) | measured/modeled |
 |---|---|---|---|
-| 1 | 11.5 | ~7.25 (steady-state; one outlier trial of 53.7ms excluded, see below) | 0.63x |
-| 2 | 11.6 | 13.74 | 1.18x |
-| 4 | 11.8 | 27.17 | **2.30x** |
+| 1 | 8.59 (was 11.5) | 7.69 (was ~7.25 steady-state, 16.54 raw) | 0.90x (was 0.63x) |
+| 2 | 8.70 (was 11.6) | 13.20 (was 13.74) | 1.52x (was 1.18x) |
+| 4 | 8.91 (was 11.8) | 24.84 (was 27.17) | **2.79x** (was 2.30x) |
 
-The model predicts **near-flat** scaling (11.5ms → 11.8ms, a 2.7% increase
+The model predicts **near-flat** scaling (8.6ms → 8.9ms; originally 11.5ms → 11.8ms, a ~3% increase
 from B=1 to B=4) because it only accounts for KV-cache-bandwidth
 contention, which is genuinely tiny for a 360M model at ctx=256
 (0.1ms/extra sequence). Reality shows **close to linear** scaling instead:
@@ -46,6 +56,12 @@ these — reported as an open question, not resolved.
 
 ## A genuine measurement artifact, disclosed
 
+**Resolved by the sync audit:** an untimed 5-step decode warm-up (plus a
+synced prefill) now runs before trial 1, and the artifact is gone. It
+also turned out to affect B=2 (18.5 vs ~11.7ms) and B=4 (34.3 vs ~23.5ms),
+not just B=1, and those means had included it. Original account, kept
+for the record:
+
 B=1's first trial measured 53.7ms vs. the next four trials' tight
 7.07-7.39ms cluster — a >7x outlier. The untimed prefill-to-ctx warm-up
 done before timing starts uses the prefill code path
@@ -59,9 +75,11 @@ smoothed over.
 
 ## Conclusion: don't trust `ConcurrencyThroughputTechnique`'s numbers for capacity planning
 
-Checked against both an independent-threads proxy (2.3x too optimistic at
-B=4) and, now, the real native-batching scenario it was actually meant to
-predict (1.72x too optimistic at B=4, 3.26x at B=8, and growing) —
+Checked against both an independent-threads proxy (2.8x too optimistic at
+B=4; originally reported as 2.3x before the sync-audit correction) and,
+now, the real native-batching scenario it was actually meant to predict
+(2.28x too optimistic at B=4, 4.28x at B=8, and growing; originally
+1.72x / 3.26x) —
 `concurrency_throughput.py`'s own docstring and `core/README.md` are
 updated to point here. The technique itself is NOT rewritten to fit these
 measurements — that would mean fitting a formula to 4 (B, ctx) points at
@@ -112,17 +130,21 @@ Python code after it, including a final save.
 
 | B | MODELED (ms) | measured: independent threads (ms) | measured: native batched (ms) | native/modeled |
 |---|---|---|---|---|
-| 1 | 11.50 | 16.54 (outlier-skewed; ~7.25 steady-state) | 7.95 | 0.69x |
-| 2 | 11.60 | 13.74 | 12.18 | 1.05x |
-| 4 | 11.81 | 27.17 | 20.31 | 1.72x |
-| 8 | 12.23 | *(not tested)* | 39.92 | **3.26x** |
+| 1 | 8.59 (was 11.50) | 7.69 (was 16.54, outlier-skewed) | 7.95 | 0.92x (was 0.69x) |
+| 2 | 8.70 (was 11.60) | 13.20 (was 13.74) | 12.18 | 1.40x (was 1.05x) |
+| 4 | 8.91 (was 11.81) | 24.84 (was 27.17) | 20.31 | 2.28x (was 1.72x) |
+| 8 | 9.33 (was 12.23) | *(not tested)* | 39.92 | **4.28x** (was 3.26x) |
+
+(Native-batched numbers are unchanged: that script reads real logits
+every step and was sync-safe by construction.)
 
 **Native batching is real and helps** — it is consistently and
 substantially faster than the independent-threads proxy at every B tested
-(e.g. 20.31ms vs 27.17ms at B=4), confirming that real GPU-level batching
+(e.g. 20.31ms vs 24.84ms at B=4), confirming that real GPU-level batching
 does provide a genuine throughput benefit over naively running independent
 contexts. But it is **still far from the MODELED "near-flat" prediction**:
-3.26x worse at B=8, and growing with B, not shrinking.
+4.28x worse at B=8 (3.26x before the sync-audit correction), and growing
+with B, not shrinking.
 
 A quick linear fit to the native-batched data (TBT(B) ≈ 3.4 + 4.6×B ms)
 fits all four points well (predicts 12.5ms at B=2, 21.7ms at B=4, vs.

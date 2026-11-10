@@ -166,6 +166,32 @@ above) can still have real error exceeding even its max LOOCV AE on some
 future run. It is a meaningfully better basis than the mean, confirmed by
 every closed-loop run above, not merely argued for.
 
+## Update after the sync-bug audit: the Qwen margin no longer holds
+
+Both llama.cpp profiles were recalibrated after the sync-bug audit
+([SYNC_AUDIT_FINDINGS.md](SYNC_AUDIT_FINDINGS.md)). Their prefill fits
+came out much cleaner, so their max-LOOCV margins shrank: **qwen_llamacpp
+31.7% → 3.4%**, **smollm2_360m_llamacpp_profile 10.4% → 6.6%**. Re-running
+the closed loop at the same 500ms SLA, 3 runs each:
+
+| profile | N | predicted | measured | SLA met |
+|---|---|---|---|---|
+| qwen_llamacpp | 1100 | 483.2ms | 509.0 / 493.2 / 499.4ms | **no** / yes / yes |
+| smollm2_360m_llamacpp_profile | 1088 | 466.7ms | 491.0 / 499.8 / 486.0ms | yes, by as little as 0.2ms |
+
+The "every profile meets its SLA with real headroom" result above **no
+longer holds** for the recalibrated profiles. The cause is not noise. All
+six runs land above prediction, because prefill has a ~26–33ms step at
+every 512-token `n_batch` boundary and both recommendations (1100, 1088)
+sit just past the 1024 boundary. The calibration grid places points
+exactly on boundaries, so LOOCV, and therefore the margin, can't see the
+step. The old 31.7% Qwen margin came from a noisier calibration run and
+covered it by luck. This is the same lesson as the section above, from a
+new direction: a margin derived from in-sample resampling can't protect
+against a structural error the sample grid never exercises. Details and
+the fix options are in SYNC_AUDIT_FINDINGS.md §6. It's left unpatched
+here, as before, rather than tuned to these runs.
+
 ## Practical implication for the "universal tool" vision
 
 A recommendation engine that only trusts its own calibration (LOOCV) can
